@@ -4,9 +4,8 @@ use std::{
     path::Path,
 };
 
-use similar::{ChangeTag, TextDiff};
-
 use anyhow::{Context, Result};
+use similar::{ChangeTag, TextDiff};
 use syn::{
     ExprCall, File, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemStruct,
     ItemTrait, ItemType, ItemUnion, Pat, Path as SynPath, UseTree, parse_file,

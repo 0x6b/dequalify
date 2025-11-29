@@ -1,6 +1,6 @@
 use std::{fs::read_to_string, io::Write};
 
-use dequalify::process_file;
+use cargo_dequalify::process_file;
 use tempfile::NamedTempFile;
 
 fn process_source(src: &str, ignore_roots: &[String], alias_on_conflict: bool) -> String {

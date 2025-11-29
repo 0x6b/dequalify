@@ -1,15 +1,21 @@
 [package]
-name = "dequalify"
+name = "cargo-dequalify"
 version = "0.1.0"
 edition = "2024"
+description = "A Rust refactoring tool that rewrites fully-qualified function calls into imported short names"
+license = "MIT"
+repository = "https://github.com/0x6b/cargo-dequalify"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 similar = "2"
-walkdir = "2"
 syn = { version = "2", features = ["full", "visit", "visit-mut"] }
-proc-macro2 = { version = "1", features = ["span-locations"] }
+ignore = "0.4.25"
+toml = "0.9.8"
+serde = { version = "1.0.228", features = ["derive"] }
+dunce = "1.0.5"
+proc-macro2 = { version = "1.0.103", features = ["span-locations"], default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

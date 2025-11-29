@@ -1,4 +1,4 @@
-# dequalify
+# cargo-dequalify
 
 A Rust refactoring tool that rewrites fully-qualified function calls into imported short names.
 
@@ -25,20 +25,20 @@ fn main() {
 
 ## Installation
 
-```sh
-cargo install --git https://github.com/0x6b/dequalify
+```console
+$ cargo install --git https://github.com/0x6b/cargo-dequalify
 ```
 
 ## Usage
 
 ```console
-$ dequalify --help
-Rewrite fully-qualified function calls into imported short names
+$ cargo dequalify --help
+Rewrite fully-qualified Rust call paths into imported short names
 
-Usage: dequalify [OPTIONS] [TARGET]
+Usage: cargo-dequalify [OPTIONS] [PATH]
 
 Arguments:
-  [TARGET]  File or directory to process (recursively for directories) [default: .]
+  [PATH]  Optional path to a package or workspace root. Defaults to current dir [default: .]
 
 Options:
   -w, --write                        Actually modify files (default: dry-run mode)
@@ -46,7 +46,7 @@ Options:
       --alias-on-conflict            When a short name would conflict, import with an alias and rewrite calls.
                                      Example: tokio::task::spawn(foo()) => use tokio::task::spawn as
                                      tokio_task_spawn; tokio_task_spawn(foo());
-      --fmt [<TOOLCHAIN>]            Run cargo fmt after writing changes. Optionally specify a toolchain (e.g.,
+  -f, --fmt [<TOOLCHAIN>]            Run cargo fmt after writing changes. Optionally specify a toolchain (e.g.,
                                      --fmt=nightly)
   -h, --help                         Print help
   -V, --version                      Print version
