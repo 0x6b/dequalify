@@ -32,14 +32,15 @@ cargo install --git https://github.com/0x6b/dequalify
 ## Usage
 
 ```sh
-# Process a single file
+# Preview changes (default, dry-run mode)
 dequalify src/main.rs
 
 # Process a directory recursively
 dequalify src/
 
-# Dry run (show what would change without modifying)
-dequalify --dry-run src/
+# Actually modify files
+dequalify --write src/
+dequalify -w src/
 
 # Verbose output
 dequalify --verbose src/

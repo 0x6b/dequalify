@@ -23,9 +23,9 @@ struct Cli {
     /// File or directory to process (recursively for directories)
     target: PathBuf,
 
-    /// Only show what would be changed, do not modify files
-    #[arg(long)]
-    dry_run: bool,
+    /// Actually modify files (default: dry-run mode)
+    #[arg(short, long)]
+    write: bool,
 
     /// Print which files were modified
     #[arg(long)]
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
 }
 
 fn process_path(path: &Path, cli: &Cli) -> Result<()> {
-    let changed = process_file(path, &cli.ignore_roots, cli.dry_run, cli.alias_on_conflict)?;
+    let changed = process_file(path, &cli.ignore_roots, !cli.write, cli.alias_on_conflict)?;
 
     if changed && cli.verbose {
         println!("modified: {}", path.display());
