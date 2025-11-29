@@ -9,11 +9,14 @@ use syn::{
     ExprCall, File, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemStruct,
     ItemTrait, ItemType, ItemUnion, Pat, Path as SynPath, UseTree, parse_file,
     spanned::Spanned,
-    visit::{self, Visit},
-    visit_mut::{self, VisitMut},
-};use visit_mut::visit_local_mut;
-use visit_mut::visit_pat_ident_mut;
-
+    visit::{
+        Visit, {self},
+    },
+    visit_mut::{
+        VisitMut, {self},
+    },
+};
+use visit_mut::{visit_local_mut, visit_pat_ident_mut};
 
 // Information about a fully-qualified function path we want to shorten.
 #[derive(Clone)]
@@ -233,7 +236,7 @@ pub fn process_file(
     // Insert use statements
     if !use_statements.is_empty() {
         use_statements.sort();
-        let use_block = use_statements.join("\n") + "\n";
+        let use_block = "\n".to_string() + &use_statements.join("\n") + "\n";
         let insert_pos = find_use_insert_position(&ast, &line_offsets);
         new_src.insert_str(insert_pos, &use_block);
     }
