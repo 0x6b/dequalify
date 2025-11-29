@@ -45,7 +45,7 @@ struct Cli {
     alias_on_conflict: bool,
 
     /// Run cargo fmt after writing changes. Optionally specify a toolchain (e.g., --fmt=nightly)
-    #[arg(long, value_name = "TOOLCHAIN")]
+    #[arg(short, long, value_name = "TOOLCHAIN")]
     fmt: Option<Option<String>>,
 }
 
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     }
 
     if any_changes && !cli.write {
-        eprintln!("# Run with -w to apply changes, or -w --fmt to also format.");
+        eprintln!("# Run with `--write` to apply changes, or `--write --fmt` to also format.");
     }
 
     if any_changes && cli.write {
