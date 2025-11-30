@@ -8,6 +8,7 @@ repository = "https://github.com/0x6b/cargo-dequalify"
 
 [dependencies]
 anyhow = "1"
+rayon = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 similar = "2"
 syn = { version = "2", features = ["full", "visit", "visit-mut"] }

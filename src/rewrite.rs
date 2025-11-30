@@ -254,8 +254,9 @@ struct Replacement {
 }
 
 // Process a single file.
-// Returns true if the file would be / was changed.
-pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Result<bool> {
+// Returns Some(diff_string) if the file would be / was changed, None otherwise.
+// In write mode, the diff string is empty but Some indicates changes occurred.
+pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Result<Option<String>> {
     let src = read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let ast: File =
         parse_file(&src).with_context(|| format!("failed to parse {}", path.display()))?;
@@ -265,7 +266,7 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
     collector.visit_file(&ast);
 
     if collector.paths.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let imported_idents = collect_imported_idents(&ast);
@@ -325,7 +326,7 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
     }
 
     if replacements.is_empty() && use_statements.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut new_src = src.clone();
@@ -363,16 +364,15 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
     }
 
     if new_src == src {
-        return Ok(false);
+        return Ok(None);
     }
 
     if dry_run {
-        print_diff(path, &src, &new_src);
-        return Ok(true);
+        return Ok(Some(format_diff(path, &src, &new_src)));
     }
 
     write(path, &new_src).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(true)
+    Ok(Some(String::new()))
 }
 
 fn path_to_string(path: &SynPath) -> String {
@@ -586,22 +586,25 @@ fn collect_pattern_idents(pat: &Pat, out: &mut BTreeSet<String>) {
     }
 }
 
-fn print_diff(path: &Path, old: &str, new: &str) {
+fn format_diff(path: &Path, old: &str, new: &str) -> String {
+    use std::fmt::Write;
     let diff = TextDiff::from_lines(old, new);
-    println!("--- {}", path.display());
-    println!("+++ {}", path.display());
+    let mut output = String::new();
+    writeln!(output, "--- {}", path.display()).unwrap();
+    writeln!(output, "+++ {}", path.display()).unwrap();
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        println!("{}", hunk.header());
+        writeln!(output, "{}", hunk.header()).unwrap();
         for change in hunk.iter_changes() {
             let sign = match change.tag() {
                 ChangeTag::Delete => "-",
                 ChangeTag::Insert => "+",
                 ChangeTag::Equal => " ",
             };
-            print!("{}{}", sign, change);
+            write!(output, "{}{}", sign, change).unwrap();
             if change.missing_newline() {
-                println!();
+                writeln!(output).unwrap();
             }
         }
     }
+    output
 }

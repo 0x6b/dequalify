@@ -88,7 +88,7 @@ impl Foo {
     file.write_all(input.as_bytes()).unwrap();
     let path = file.path().to_path_buf();
     let changed = process_file(&path, &[], false).unwrap();
-    assert!(!changed);
+    assert!(changed.is_none());
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn main() {
     file.write_all(input.as_bytes()).unwrap();
     let path = file.path().to_path_buf();
     let changed = process_file(&path, &[], false).unwrap();
-    assert!(!changed);
+    assert!(changed.is_none());
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn main() {
     file.write_all(input.as_bytes()).unwrap();
     let path = file.path().to_path_buf();
     let changed = process_file(&path, &[], true).unwrap();
-    assert!(changed);
+    assert!(changed.is_some());
     let content = read_to_string(&path).unwrap();
     assert_eq!(content, input);
 }
@@ -393,7 +393,7 @@ fn main() {
     file.write_all(input.as_bytes()).unwrap();
     let path = file.path().to_path_buf();
     let changed = process_file(&path, &[], false).unwrap();
-    assert!(!changed);
+    assert!(changed.is_none());
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn main() {
     file.write_all(input.as_bytes()).unwrap();
     let path = file.path().to_path_buf();
     let changed = process_file(&path, &[], false).unwrap();
-    assert!(!changed);
+    assert!(changed.is_none());
 }
 
 #[test]
@@ -424,7 +424,7 @@ fn main() {
     file.write_all(input.as_bytes()).unwrap();
     let path = file.path().to_path_buf();
     let changed = process_file(&path, &[], false).unwrap();
-    assert!(!changed);
+    assert!(changed.is_none());
 }
 
 #[test]

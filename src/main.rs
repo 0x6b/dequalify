@@ -5,11 +5,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use dunce::canonicalize;
+use rayon::prelude::*;
 use fs::read_to_string;
 use ignore::WalkBuilder;
 use rewrite::process_file;
@@ -90,9 +95,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let crate_roots = workspace_crate_roots(&cargo_toml_path, &workspace);
-
-    let mut any_changes = false;
+    let mut crate_roots = workspace_crate_roots(&cargo_toml_path, &workspace);
 
     if crate_roots.is_empty() {
         // Fall back to treating the directory with Cargo.toml as a single crate.
@@ -100,12 +103,51 @@ fn main() -> Result<()> {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        any_changes |= process_crate(&crate_root, &cli)?;
-    } else {
-        for crate_root in crate_roots {
-            any_changes |= process_crate(&crate_root, &cli)?;
+        crate_roots.push(crate_root);
+    }
+
+    // Collect all .rs files from all crates
+    let mut rs_files: Vec<PathBuf> = Vec::new();
+    for crate_root in &crate_roots {
+        let walker = WalkBuilder::new(crate_root)
+            .standard_filters(true)
+            .hidden(false)
+            .follow_links(false)
+            .build();
+
+        for entry in walker.filter_map(|r| r.ok()) {
+            let path = entry.path();
+            if path.is_file() && path.extension() == Some(OsStr::new("rs")) {
+                rs_files.push(path.to_path_buf());
+            }
         }
     }
+
+    let any_changes = AtomicBool::new(false);
+    let diffs: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+    // Process all files in parallel
+    rs_files.par_iter().for_each(|path| {
+        match process_file(path, &cli.ignore_roots, !cli.write) {
+            Ok(Some(diff)) => {
+                any_changes.store(true, Ordering::Relaxed);
+                if !diff.is_empty() {
+                    diffs.lock().unwrap().push((path.clone(), diff));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("error processing {}: {}", path.display(), e),
+        }
+    });
+
+    // Print diffs sorted by path (deterministic output)
+    let mut diffs = diffs.into_inner().unwrap();
+    diffs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, diff) in diffs {
+        print!("{}", diff);
+    }
+
+    let any_changes = any_changes.load(Ordering::Relaxed);
 
     if any_changes && !cli.write {
         eprintln!("# Run with `-w` to apply changes, or `-w -f` to also format.");
@@ -243,44 +285,3 @@ fn workspace_crate_roots(cargo_toml: &Path, ws: &WorkspaceInfo) -> Vec<PathBuf> 
     roots
 }
 
-/// Process all .rs files under a crate root, honoring .gitignore (global and local).
-fn process_crate(crate_root: &Path, cli: &Cli) -> Result<bool> {
-    // Build a walker that:
-    // - Starts at crate_root
-    // - Respects .gitignore, .git/info/exclude, global gitignore
-    // - Skips VCS ignores only if explicitly configured (we keep defaults)
-    // - Follows ignore rules by default
-    let mut builder = WalkBuilder::new(crate_root);
-    builder
-        .standard_filters(true) // ignore .git, target, etc. via .gitignore and defaults
-        .hidden(false) // let .gitignore decide; not "hidden" heuristic
-        .follow_links(false); // avoid symlink surprises in workspaces
-
-    let walker = builder.build();
-
-    let mut any_changes = false;
-
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(err) => {
-                eprintln!("walk error under {}: {err}", crate_root.display());
-                continue;
-            }
-        };
-
-        let path = entry.path();
-
-        if !path.is_file() {
-            continue;
-        }
-
-        if path.extension() != Some(OsStr::new("rs")) {
-            continue;
-        }
-
-        any_changes |= process_file(path, &cli.ignore_roots, !cli.write)?;
-    }
-
-    Ok(any_changes)
-}
