@@ -606,3 +606,24 @@ fn main() {
     assert!(!output.contains("use std::println;"));
     assert!(output.contains("std::println!"));
 }
+
+#[test]
+fn test_skip_primitive_type_methods() {
+    // Primitive types like u32, i64, etc. cannot be imported via `use`
+    // e.g., `use u32::try_from;` is invalid Rust
+    let input = r#"
+fn main() {
+    let x = u32::try_from(42u64).unwrap();
+    let y = u64::from(42u32);
+    let z = i32::try_from(100i64).unwrap();
+    let w = usize::try_from(10u32).unwrap();
+    let f = f64::from(1.0f32);
+}
+"#;
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(input.as_bytes()).unwrap();
+    let path = file.path().to_path_buf();
+    let changed = process_file(&path, &[], false).unwrap();
+    // No changes should be made - primitive type methods should be skipped
+    assert!(changed.is_none());
+}

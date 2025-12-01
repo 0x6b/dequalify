@@ -19,6 +19,15 @@ use syn::{
 };
 use visit_mut::{visit_local_mut, visit_pat_ident_mut};
 
+/// Rust primitive types that cannot be imported via `use` statements.
+/// These include numeric types, bool, char, str, and never type.
+const PRIMITIVE_TYPES: &[&str] = &[
+    "bool", "char", "str",
+    "i8", "i16", "i32", "i64", "i128", "isize",
+    "u8", "u16", "u32", "u64", "u128", "usize",
+    "f32", "f64",
+];
+
 // A single occurrence of a path in the source that needs rewriting.
 #[derive(Clone, Debug)]
 struct PathOccurrence {
@@ -46,7 +55,7 @@ impl<'a> PathCollector<'a> {
     }
 }
 
-impl<'a> Visit<'_> for PathCollector<'a> {
+impl Visit<'_> for PathCollector<'_> {
     fn visit_expr_call(&mut self, node: &ExprCall) {
         if let syn::Expr::Path(expr_path) = &*node.func
             && expr_path.qself.is_none()
@@ -63,9 +72,13 @@ impl<'a> Visit<'_> for PathCollector<'a> {
                 let second_to_last = &segments[segments.len() - 2].ident.to_string();
                 let second_to_last_char = second_to_last.chars().next().unwrap_or('a');
 
+                // Skip primitive types - they cannot be imported via `use`
+                let is_primitive_method = PRIMITIVE_TYPES.contains(&second_to_last.as_str());
+
                 if first_name != "Self"
                     && !first_char.is_uppercase()
                     && !second_to_last_char.is_uppercase()
+                    && !is_primitive_method
                     && !self.ignore_roots.contains(&first_name)
                 {
                     let full_str = path_to_string(path);
@@ -129,10 +142,10 @@ impl<'a> Visit<'_> for PathCollector<'a> {
 /// Represents a path's import strategy at a given level.
 /// `import_len` is how many segments to import (from the start).
 /// For path `a::b::c::func` with 4 segments:
-/// - import_len=4: `use a::b::c::func;` → `func()`
-/// - import_len=3: `use a::b::c;` → `c::func()`
-/// - import_len=2: `use a::b;` → `b::c::func()`
-/// - import_len=1: `use a;` → `a::b::c::func()` (same as original, skip)
+/// - `import_len=4`: `use a::b::c::func;` → `func()`
+/// - `import_len=3`: `use a::b::c;` → `c::func()`
+/// - `import_len=2`: `use a::b;` → `b::c::func()`
+/// - `import_len=1`: `use a;` → `a::b::c::func()` (same as original, skip)
 #[derive(Clone)]
 struct ImportStrategy {
     full_path: String,
@@ -356,14 +369,14 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
     // Insert use statements FIRST, before applying replacements.
     // This is important because insert_pos is calculated from the original source,
     // and replacements would shift byte positions.
-    let use_block_len = if !use_statements.is_empty() {
+    let use_block_len = if use_statements.is_empty() {
+        (0, 0)
+    } else {
         use_statements.sort();
         let use_block = "\n".to_string() + &use_statements.join("\n") + "\n";
         let insert_pos = find_use_insert_position(&ast, &line_offsets);
         new_src.insert_str(insert_pos, &use_block);
         (insert_pos, use_block.len())
-    } else {
-        (0, 0)
     };
 
     // Sort replacements by start position descending (so we can apply from end to start)
@@ -442,7 +455,7 @@ impl LineOffsets {
         if col >= char_offsets.len() {
             // Column is at or past end of line - return end of line
             // This can happen for end positions
-            return Some(line_start + char_offsets.last().map(|&o| o + 1).unwrap_or(0));
+            return Some(line_start + char_offsets.last().map_or(0, |&o| o + 1));
         }
         Some(line_start + char_offsets[col])
     }
@@ -461,7 +474,7 @@ impl LineOffsets {
             // We don't have total length here, so fall back to line_col_to_byte approach
             // For last line, there's no trailing newline to worry about
             let (line_start, char_offsets) = &self.lines[line - 1];
-            line_start + char_offsets.last().map(|&o| o + 1).unwrap_or(0)
+            line_start + char_offsets.last().map_or(0, |&o| o + 1)
         }
     }
 }
@@ -622,7 +635,7 @@ fn format_diff(path: &Path, old: &str, new: &str) -> String {
                 ChangeTag::Insert => "+",
                 ChangeTag::Equal => " ",
             };
-            write!(output, "{}{}", sign, change).unwrap();
+            write!(output, "{sign}{change}").unwrap();
             if change.missing_newline() {
                 writeln!(output).unwrap();
             }

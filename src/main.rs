@@ -38,7 +38,7 @@ use anyhow::bail;
 ///   - Runs on the current workspace (or single crate)
 ///   - Uses dry-run mode (use -w to write changes)
 ///   - On conflict, imports the parent module instead
-///     (e.g., tokio::task::spawn → use tokio::task; task::spawn())
+///     (e.g., `tokio::task::spawn` → use `tokio::task`; `task::spawn()`)
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
             .follow_links(false)
             .build();
 
-        for entry in walker.filter_map(|r| r.ok()) {
+        for entry in walker.filter_map(std::result::Result::ok) {
             let path = entry.path();
             if path.is_file() && path.extension() == Some(OsStr::new("rs")) {
                 rs_files.push(path.to_path_buf());
@@ -146,7 +146,7 @@ fn main() -> Result<()> {
     let mut diffs = diffs.into_inner().unwrap();
     diffs.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, diff) in diffs {
-        print!("{}", diff);
+        print!("{diff}");
     }
 
     let any_changes = any_changes.load(Ordering::Relaxed);
@@ -168,13 +168,13 @@ fn main() -> Result<()> {
 fn run_cargo_fmt(toolchain: Option<&str>) -> Result<()> {
     let mut cmd = Command::new("cargo");
     if let Some(tc) = toolchain {
-        cmd.arg(format!("+{}", tc));
+        cmd.arg(format!("+{tc}"));
     }
     cmd.arg("fmt");
 
     let status = cmd.status().context("failed to run cargo fmt")?;
     if !status.success() {
-        bail!("cargo fmt failed with {}", status);
+        bail!("cargo fmt failed with {status}");
     }
     Ok(())
 }
