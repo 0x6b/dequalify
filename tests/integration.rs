@@ -809,39 +809,40 @@ fn after_mod() {
 }
 
 #[test]
-fn test_use_inside_function_not_dequalified() {
+fn test_use_inside_function_expanded() {
     // `use` inside a function creates a local alias - paths using that alias
-    // should NOT be dequalified since the first segment is not a crate root
+    // are now expanded and dequalified.
+    // e.g., `use tokio::task;` and `task::spawn()` -> expands to `tokio::task::spawn`
     let input = r#"
 fn some_function() {
     use tokio::task;
     task::spawn(async {});
 }
 "#;
-    let mut file = NamedTempFile::new().unwrap();
-    file.write_all(input.as_bytes()).unwrap();
-    let path = file.path().to_path_buf();
-    let changed = process_file(&path, &[], false).unwrap();
-    // No changes should be made - task is a local alias, not a crate
-    assert!(changed.is_none());
+    let output = process_source(input, &[]);
+    // Should add use for the expanded path
+    assert!(output.contains("use tokio::task::spawn;"));
+    // task::spawn should be replaced with spawn
+    assert!(output.contains("spawn(async"));
+    // The original local import remains (we don't remove it)
+    assert!(output.contains("use tokio::task;"));
 }
 
 #[test]
 fn test_mixed_local_import_and_crate_path() {
-    // If there's a local import and a separate crate path, only the crate path
-    // should be dequalified
+    // If there's a local import and a separate crate path, both should be dequalified
     let input = r#"
 fn some_function() {
     use tokio::task;
-    task::spawn(async {});  // uses local import, skip
+    task::spawn(async {});  // expands to tokio::task::spawn, then dequalified
     std::fs::read_to_string("x");  // crate path, dequalify
 }
 "#;
     let output = process_source(input, &[]);
-    // Should have use for read_to_string
+    // Should have use for both
     assert!(output.contains("use std::fs::read_to_string;"));
-    // task::spawn should remain unchanged
-    assert!(output.contains("task::spawn(async"));
-    // read_to_string should be dequalified
+    assert!(output.contains("use tokio::task::spawn;"));
+    // Both should be dequalified
+    assert!(output.contains("spawn(async"));
     assert!(output.contains("read_to_string(\"x\")"));
 }

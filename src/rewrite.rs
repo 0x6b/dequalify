@@ -63,9 +63,10 @@ struct PathCollector<'a> {
     scope_infos: BTreeMap<String, ScopeInfo>,
     /// Line offsets for byte position calculation
     line_offsets: &'a LineOffsets,
-    /// Names imported via `use` statements anywhere in the file (including inside functions).
-    /// These names should not be treated as crate roots when encountered as path prefixes.
-    all_imported_names: BTreeSet<String>,
+    /// Mapping from imported names to their full paths.
+    /// e.g., `use tokio::task;` creates mapping: "task" → "tokio::task"
+    /// This allows expanding `task::spawn` to `tokio::task::spawn`.
+    import_mappings: BTreeMap<String, String>,
 }
 
 impl<'a> PathCollector<'a> {
@@ -77,7 +78,7 @@ impl<'a> PathCollector<'a> {
             scope_stack: Vec::new(),
             scope_infos: BTreeMap::new(),
             line_offsets,
-            all_imported_names: BTreeSet::new(),
+            import_mappings: BTreeMap::new(),
         }
     }
 
@@ -86,19 +87,26 @@ impl<'a> PathCollector<'a> {
         self.scope_stack.join("::")
     }
 
-    /// Check if a name is imported via a `use` statement somewhere in the file.
-    /// Such names should not be treated as crate roots.
-    fn is_locally_imported(&self, name: &str) -> bool {
-        self.all_imported_names.contains(name)
+    /// Try to expand a path using import mappings.
+    /// e.g., if `task` maps to `tokio::task`, then `task::spawn` expands to `tokio::task::spawn`.
+    /// Returns the expanded path if the first segment is imported, otherwise None.
+    fn expand_path(&self, first_segment: &str, remaining_segments: &[String]) -> Option<String> {
+        self.import_mappings.get(first_segment).map(|base_path| {
+            if remaining_segments.is_empty() {
+                base_path.clone()
+            } else {
+                format!("{}::{}", base_path, remaining_segments.join("::"))
+            }
+        })
     }
 }
 
 impl Visit<'_> for PathCollector<'_> {
-    // Collect all imported names from `use` statements anywhere in the file.
-    // This includes `use` in functions, which create local aliases that shouldn't
-    // be treated as crate roots.
+    // Collect all import mappings from `use` statements anywhere in the file.
+    // This includes `use` in functions, which create local aliases.
+    // We track the full path so we can expand paths like `task::spawn` to `tokio::task::spawn`.
     fn visit_item_use(&mut self, node: &syn::ItemUse) {
-        collect_use_idents(&node.tree, &mut self.all_imported_names);
+        collect_use_mappings(&node.tree, &Vec::new(), &mut self.import_mappings);
         visit::visit_item_use(self, node);
     }
 
@@ -111,28 +119,41 @@ impl Visit<'_> for PathCollector<'_> {
             if segments.len() >= 2 {
                 let first_ident = &segments[0].ident;
                 let first_name = first_ident.to_string();
-                let first_char = first_name.chars().next().unwrap_or('a');
+
+                // Try to expand the path if the first segment is a local import.
+                // e.g., if `use tokio::task;` then `task::spawn` expands to `tokio::task::spawn`
+                let remaining: Vec<String> = segments.iter().skip(1).map(|s| s.ident.to_string()).collect();
+                let (full_str, effective_first_name) = if let Some(expanded) = self.expand_path(&first_name, &remaining) {
+                    // Path was expanded - use the expanded version
+                    let expanded_first = expanded.split("::").next().unwrap_or(&first_name).to_string();
+                    (expanded, expanded_first)
+                } else {
+                    // No expansion needed - use the original path
+                    (path_to_string(path), first_name.clone())
+                };
+
+                let first_char = effective_first_name.chars().next().unwrap_or('a');
 
                 // Check if second-to-last segment is uppercase (type associated function)
                 // e.g., pdf2svg::Cli::try_new() - Cli is the type
-                let second_to_last = &segments[segments.len() - 2].ident.to_string();
+                // Use the expanded path for this check
+                let expanded_segments: Vec<&str> = full_str.split("::").collect();
+                let second_to_last = if expanded_segments.len() >= 2 {
+                    expanded_segments[expanded_segments.len() - 2]
+                } else {
+                    ""
+                };
                 let second_to_last_char = second_to_last.chars().next().unwrap_or('a');
 
                 // Skip primitive types - they cannot be imported via `use`
-                let is_primitive_method = PRIMITIVE_TYPES.contains(&second_to_last.as_str());
+                let is_primitive_method = PRIMITIVE_TYPES.contains(&second_to_last);
 
-                // Skip if first segment is a locally imported name (not a crate root)
-                let is_local_import = self.is_locally_imported(&first_name);
-
-                if first_name != "Self"
+                if effective_first_name != "Self"
                     && !first_char.is_uppercase()
                     && !second_to_last_char.is_uppercase()
                     && !is_primitive_method
-                    && !self.ignore_roots.contains(&first_name)
-                    && !is_local_import
+                    && !self.ignore_roots.contains(&effective_first_name)
                 {
-                    let full_str = path_to_string(path);
-
                     // Get span info for the entire path expression
                     let span = expr_path.span();
                     let start = span.start();
@@ -220,18 +241,22 @@ impl Visit<'_> for PathCollector<'_> {
         if segments.len() >= 2 {
             let first_ident = &segments[0].ident;
             let first_name = first_ident.to_string();
-            let first_char = first_name.chars().next().unwrap_or('a');
 
-            // Skip if first segment is a locally imported name (not a crate root)
-            let is_local_import = self.is_locally_imported(&first_name);
+            // Try to expand the path if the first segment is a local import.
+            let remaining: Vec<String> = segments.iter().skip(1).map(|s| s.ident.to_string()).collect();
+            let (full_str, effective_first_name) = if let Some(expanded) = self.expand_path(&first_name, &remaining) {
+                let expanded_first = expanded.split("::").next().unwrap_or(&first_name).to_string();
+                (expanded, expanded_first)
+            } else {
+                (path_to_string(path), first_name.clone())
+            };
 
-            if first_name != "Self"
+            let first_char = effective_first_name.chars().next().unwrap_or('a');
+
+            if effective_first_name != "Self"
                 && !first_char.is_uppercase()
-                && !self.ignore_roots.contains(&first_name)
-                && !is_local_import
+                && !self.ignore_roots.contains(&effective_first_name)
             {
-                let full_str = path_to_string(path);
-
                 // Get span info for just the path (not including ! and args)
                 let span = path.segments.span();
                 let start = span.start();
@@ -671,6 +696,45 @@ fn collect_use_idents(tree: &UseTree, out: &mut BTreeSet<String>) {
             }
         }
         UseTree::Glob(_g) => {}
+    }
+}
+
+/// Collect import mappings from a use tree.
+/// Maps the imported name to its full path.
+/// e.g., `use tokio::task;` creates mapping: `task` → `tokio::task`
+/// e.g., `use tokio::task as t;` creates mapping: `t` → `tokio::task`
+fn collect_use_mappings(tree: &UseTree, prefix: &[String], out: &mut BTreeMap<String, String>) {
+    match tree {
+        UseTree::Name(n) => {
+            let name = n.ident.to_string();
+            let mut full_path_parts: Vec<String> = prefix.to_vec();
+            full_path_parts.push(name.clone());
+            let full_path = full_path_parts.join("::");
+            out.insert(name, full_path);
+        }
+        UseTree::Rename(r) => {
+            // `use foo::bar as baz;` - baz maps to foo::bar
+            let alias = r.rename.to_string();
+            let original = r.ident.to_string();
+            let mut full_path_parts: Vec<String> = prefix.to_vec();
+            full_path_parts.push(original);
+            let full_path = full_path_parts.join("::");
+            out.insert(alias, full_path);
+        }
+        UseTree::Path(p) => {
+            let segment = p.ident.to_string();
+            let mut new_prefix: Vec<String> = prefix.to_vec();
+            new_prefix.push(segment);
+            collect_use_mappings(&p.tree, &new_prefix, out);
+        }
+        UseTree::Group(g) => {
+            for t in &g.items {
+                collect_use_mappings(t, prefix, out);
+            }
+        }
+        UseTree::Glob(_g) => {
+            // Glob imports don't create specific mappings we can track
+        }
     }
 }
 
