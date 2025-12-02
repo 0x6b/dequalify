@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     fs::{read_to_string, write},
     path::Path,
@@ -36,6 +37,19 @@ struct PathOccurrence {
     start_col: usize,
     end_line: usize,
     end_col: usize,
+    /// The scope this occurrence is in ("" for file level, "tests" for mod tests, etc.)
+    scope: String,
+}
+
+/// Information about a scope (file level or module) for use statement insertion.
+#[derive(Debug)]
+struct ScopeInfo {
+    /// Byte position where use statements should be inserted
+    insert_pos: usize,
+    /// Existing imported identifiers in this scope
+    imported_idents: BTreeSet<String>,
+    /// Indentation prefix for use statements in this scope (e.g., "    " for 4 spaces)
+    indent: String,
 }
 
 // Collect all candidate fully-qualified paths from function calls.
@@ -43,15 +57,29 @@ struct PathCollector<'a> {
     paths: BTreeSet<String>,
     occurrences: Vec<PathOccurrence>,
     ignore_roots: &'a BTreeSet<String>,
+    /// Current scope path segments (e.g., ["tests"] when inside `mod tests { }`)
+    scope_stack: Vec<String>,
+    /// Per-scope information for use statement insertion
+    scope_infos: BTreeMap<String, ScopeInfo>,
+    /// Line offsets for byte position calculation
+    line_offsets: &'a LineOffsets,
 }
 
 impl<'a> PathCollector<'a> {
-    fn new(ignore_roots: &'a BTreeSet<String>) -> Self {
+    fn new(ignore_roots: &'a BTreeSet<String>, line_offsets: &'a LineOffsets) -> Self {
         Self {
             paths: BTreeSet::new(),
             occurrences: Vec::new(),
             ignore_roots,
+            scope_stack: Vec::new(),
+            scope_infos: BTreeMap::new(),
+            line_offsets,
         }
+    }
+
+    /// Get the current scope as a string (e.g., "" for file level, "tests" for mod tests)
+    fn current_scope(&self) -> String {
+        self.scope_stack.join("::")
     }
 }
 
@@ -96,11 +124,70 @@ impl Visit<'_> for PathCollector<'_> {
                         start_col: start.column,
                         end_line: end.line,
                         end_col: end.column,
+                        scope: self.current_scope(),
                     });
                 }
             }
         }
         visit::visit_expr_call(self, node);
+    }
+
+    fn visit_item_mod(&mut self, node: &ItemMod) {
+        // Only process inline modules (with content)
+        if let Some((brace, items)) = &node.content {
+            let mod_name = node.ident.to_string();
+            self.scope_stack.push(mod_name);
+            let current_scope = self.current_scope();
+
+            // Find last use statement in this module and collect imported idents
+            let mut last_use_line: Option<usize> = None;
+            let mut imported_idents = BTreeSet::new();
+
+            for item in items {
+                if let Item::Use(item_use) = item {
+                    let span = item_use.span();
+                    let end_line = span.end().line;
+                    last_use_line = Some(end_line);
+                    collect_use_idents(&item_use.tree, &mut imported_idents);
+                }
+            }
+
+            // Determine indentation from the first item in the module, or use default
+            let indent = if let Some(first_item) = items.first() {
+                let col = first_item.span().start().column;
+                " ".repeat(col)
+            } else {
+                // No items, calculate based on nesting level (4 spaces per level)
+                " ".repeat(4 * self.scope_stack.len())
+            };
+
+            // Calculate insertion position
+            let insert_pos = if let Some(line) = last_use_line {
+                self.line_offsets.line_end_byte(line)
+            } else {
+                // Insert at the end of the line containing the opening brace
+                // (so the new use statement starts on the next line with proper indentation)
+                let brace_span = brace.span.open();
+                self.line_offsets.line_end_byte(brace_span.end().line)
+            };
+
+            self.scope_infos.insert(
+                current_scope,
+                ScopeInfo {
+                    insert_pos,
+                    imported_idents,
+                    indent,
+                },
+            );
+
+            // Visit children
+            visit::visit_item_mod(self, node);
+
+            self.scope_stack.pop();
+        } else {
+            // External module (mod foo;) - just visit normally
+            visit::visit_item_mod(self, node);
+        }
     }
 
     fn visit_macro(&mut self, node: &syn::Macro) {
@@ -132,6 +219,7 @@ impl Visit<'_> for PathCollector<'_> {
                     start_col: start.column,
                     end_line: end.line,
                     end_col: end.column,
+                    scope: self.current_scope(),
                 });
             }
         }
@@ -285,12 +373,23 @@ fn resolve_all_imports(
     result
 }
 
-// A text replacement to apply.
+/// Represents an edit to apply to the source.
 #[derive(Debug)]
-struct Replacement {
-    start: usize,
-    end: usize,
-    new_text: String,
+enum Edit {
+    /// Insert text at a position
+    Insert { pos: usize, text: String },
+    /// Replace a range with new text
+    Replace { start: usize, end: usize, text: String },
+}
+
+impl Edit {
+    /// Get the position used for sorting (we sort descending to apply from end to start)
+    fn sort_position(&self) -> usize {
+        match self {
+            Edit::Insert { pos, .. } => *pos,
+            Edit::Replace { start, .. } => *start,
+        }
+    }
 }
 
 // Process a single file.
@@ -301,101 +400,119 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
     let ast: File =
         parse_file(&src).with_context(|| format!("failed to parse {}", path.display()))?;
 
+    let line_offsets = LineOffsets::new(&src);
     let ignore_set: BTreeSet<String> = ignore_roots.iter().cloned().collect();
-    let mut collector = PathCollector::new(&ignore_set);
+    let mut collector = PathCollector::new(&ignore_set, &line_offsets);
+
+    // Initialize file-level scope info (empty scope path "")
+    let file_level_imported = collect_imported_idents(&ast);
+    let file_level_insert_pos = find_use_insert_position(&ast, &line_offsets);
+    collector.scope_infos.insert(
+        String::new(),
+        ScopeInfo {
+            insert_pos: file_level_insert_pos,
+            imported_idents: file_level_imported.clone(),
+            indent: String::new(), // No indentation at file level
+        },
+    );
+
     collector.visit_file(&ast);
 
     if collector.paths.is_empty() {
         return Ok(None);
     }
 
-    let imported_idents = collect_imported_idents(&ast);
     let local_idents = collect_local_idents(&ast);
-    let existing_idents: BTreeSet<String> = imported_idents
-        .union(&local_idents)
-        .cloned()
-        .collect();
 
-    let line_offsets = LineOffsets::new(&src);
-
-    // Group occurrences by path for efficient lookup
-    let mut occ_by_path: BTreeMap<&str, Vec<&PathOccurrence>> = BTreeMap::new();
+    // Group occurrences by scope
+    let mut occ_by_scope: BTreeMap<&str, Vec<&PathOccurrence>> = BTreeMap::new();
     for occ in &collector.occurrences {
-        occ_by_path.entry(&occ.full_path_str).or_default().push(occ);
+        occ_by_scope.entry(&occ.scope).or_default().push(occ);
     }
 
-    // Collect all unique paths
-    let all_paths: Vec<String> = collector.paths.iter().cloned().collect();
+    let mut edits: Vec<Edit> = Vec::new();
 
-    // Resolve all imports using multi-pass algorithm
-    let strategies = resolve_all_imports(&all_paths, &existing_idents);
+    // Process each scope
+    for (scope, occurrences) in &occ_by_scope {
+        // Get scope info (if not found, use file-level - shouldn't happen but be safe)
+        let scope_info = collector.scope_infos.get(*scope).unwrap_or_else(|| {
+            collector.scope_infos.get("").unwrap()
+        });
 
-    // Build replacements for each occurrence
-    let mut replacements: Vec<Replacement> = Vec::new();
-    let mut use_statements: Vec<String> = Vec::new();
+        // Combine file-level imports with scope-specific imports for conflict detection
+        let mut existing_idents: BTreeSet<String> = file_level_imported.clone();
+        existing_idents.extend(scope_info.imported_idents.clone());
+        existing_idents.extend(local_idents.clone());
 
-    for full_path_str in &collector.paths {
-        let Some(strategy) = strategies.get(full_path_str) else {
-            // Path couldn't be resolved (all levels conflict) - silently skip
-            continue;
-        };
+        // Collect unique paths in this scope
+        let scope_paths: BTreeSet<&str> = occurrences.iter().map(|o| o.full_path_str.as_str()).collect();
+        let scope_paths_vec: Vec<String> = scope_paths.iter().map(|&s| s.to_owned()).collect();
 
-        use_statements.push(strategy.use_statement());
-        let replacement_text = strategy.replacement();
+        // Resolve imports for this scope
+        let strategies = resolve_all_imports(&scope_paths_vec, &existing_idents);
 
-        // Create replacements for all occurrences of this path
-        if let Some(occurrences) = occ_by_path.get(full_path_str.as_str()) {
-            for occ in occurrences {
-                let start_byte = line_offsets.line_col_to_byte(occ.start_line, occ.start_col);
-                let end_byte = line_offsets.line_col_to_byte(occ.end_line, occ.end_col);
+        // Build use statements and replacements for this scope
+        let mut use_statements: Vec<String> = Vec::new();
 
-                if let (Some(start), Some(end)) = (start_byte, end_byte) {
-                    replacements.push(Replacement {
-                        start,
-                        end,
-                        new_text: replacement_text.clone(),
-                    });
-                }
+        for occ in occurrences {
+            let Some(strategy) = strategies.get(&occ.full_path_str) else {
+                continue;
+            };
+
+            // Add use statement (will be deduplicated later)
+            let use_stmt = strategy.use_statement();
+            if !use_statements.contains(&use_stmt) {
+                use_statements.push(use_stmt);
             }
+
+            // Create replacement for this occurrence
+            let start_byte = line_offsets.line_col_to_byte(occ.start_line, occ.start_col);
+            let end_byte = line_offsets.line_col_to_byte(occ.end_line, occ.end_col);
+
+            if let (Some(start), Some(end)) = (start_byte, end_byte) {
+                edits.push(Edit::Replace {
+                    start,
+                    end,
+                    text: strategy.replacement(),
+                });
+            }
+        }
+
+        // Create use block insertion for this scope
+        if !use_statements.is_empty() {
+            use_statements.sort();
+            let indent = &scope_info.indent;
+            // Add indentation to each use statement
+            let indented_uses: Vec<String> = use_statements
+                .iter()
+                .map(|s| format!("{indent}{s}"))
+                .collect();
+            let use_block = "\n".to_string() + &indented_uses.join("\n");
+            edits.push(Edit::Insert {
+                pos: scope_info.insert_pos,
+                text: use_block,
+            });
         }
     }
 
-    if replacements.is_empty() && use_statements.is_empty() {
+    if edits.is_empty() {
         return Ok(None);
     }
 
+    // Sort edits by position descending (apply from end to start)
+    edits.sort_by_key(|e| Reverse(e.sort_position()));
+
+    // Apply edits
     let mut new_src = src.clone();
-
-    // Insert use statements FIRST, before applying replacements.
-    // This is important because insert_pos is calculated from the original source,
-    // and replacements would shift byte positions.
-    let use_block_len = if use_statements.is_empty() {
-        (0, 0)
-    } else {
-        use_statements.sort();
-        let use_block = "\n".to_string() + &use_statements.join("\n") + "\n";
-        let insert_pos = find_use_insert_position(&ast, &line_offsets);
-        new_src.insert_str(insert_pos, &use_block);
-        (insert_pos, use_block.len())
-    };
-
-    // Sort replacements by start position descending (so we can apply from end to start)
-    replacements.sort_by(|a, b| b.start.cmp(&a.start));
-
-    // Apply replacements to source, adjusting offsets for the inserted use block
-    let (use_insert_pos, use_len) = use_block_len;
-    for repl in &replacements {
-        let adjusted_start = if repl.start >= use_insert_pos {
-            repl.start + use_len
-        } else {
-            repl.start
-        };
-        let adjusted_end = if repl.end >= use_insert_pos {
-            repl.end + use_len
-        } else {
-            repl.end
-        };
-        new_src.replace_range(adjusted_start..adjusted_end, &repl.new_text);
+    for edit in edits {
+        match edit {
+            Edit::Insert { pos, text } => {
+                new_src.insert_str(pos, &text);
+            }
+            Edit::Replace { start, end, text } => {
+                new_src.replace_range(start..end, &text);
+            }
+        }
     }
 
     if new_src == src {

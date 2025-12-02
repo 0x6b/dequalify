@@ -627,3 +627,153 @@ fn main() {
     // No changes should be made - primitive type methods should be skipped
     assert!(changed.is_none());
 }
+
+#[test]
+fn test_use_inside_mod() {
+    // Use statements should be placed inside the module where the code is
+    let input = r#"
+mod tests {
+    fn test_foo() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Use statement should be inside mod tests, not at file level
+    assert!(output.contains("mod tests {\n    use tokio::task::spawn;"));
+    assert!(output.contains("spawn(async"));
+    // Use statement should NOT be at file level (before mod tests)
+    assert!(!output.starts_with("\nuse tokio::task::spawn;"));
+}
+
+#[test]
+fn test_use_inside_mod_with_existing_use() {
+    // New use statements should be placed after existing uses in the module
+    let input = r#"
+mod tests {
+    use std::time::Instant;
+
+    fn test_foo() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Use statement should be inside mod tests after the existing use
+    assert!(output.contains("use std::time::Instant;\n    use tokio::task::spawn;"));
+    assert!(output.contains("spawn(async"));
+}
+
+#[test]
+fn test_use_in_nested_mod() {
+    // Use statements should be placed in the innermost containing module
+    let input = r#"
+mod outer {
+    mod inner {
+        fn test_foo() {
+            tokio::task::spawn(async {});
+        }
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Use statement should be inside mod inner
+    assert!(output.contains("mod inner {\n        use tokio::task::spawn;"));
+}
+
+#[test]
+fn test_multiple_mods_separate_uses() {
+    // Each module should get its own use statements
+    let input = r#"
+mod mod_a {
+    fn foo() {
+        tokio::task::spawn(async {});
+    }
+}
+
+mod mod_b {
+    fn bar() {
+        std::fs::read_to_string("x");
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // mod_a should have spawn import
+    assert!(output.contains("mod mod_a {\n    use tokio::task::spawn;"));
+    // mod_b should have read_to_string import
+    assert!(output.contains("mod mod_b {\n    use std::fs::read_to_string;"));
+}
+
+#[test]
+fn test_file_level_and_mod_level() {
+    // Uses at file level should stay at file level, mod level should be in mod
+    let input = r#"
+fn main() {
+    std::fs::read_to_string("x");
+}
+
+mod tests {
+    fn test_foo() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // File level should have read_to_string
+    assert!(output.contains("\nuse std::fs::read_to_string;\n"));
+    // mod tests should have spawn (not at file level)
+    assert!(output.contains("mod tests {\n    use tokio::task::spawn;"));
+}
+
+#[test]
+fn test_nested_mods_with_calls_at_each_level() {
+    // Test multiple nested modules with calls at each level
+    let input = r#"
+mod outer {
+    fn outer_fn() {
+        tokio::task::spawn(async {});
+    }
+
+    mod inner {
+        fn inner_fn() {
+            std::fs::read_to_string("x");
+        }
+
+        mod deepest {
+            fn deepest_fn() {
+                anyhow::bail!("error");
+            }
+        }
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // outer should have spawn
+    assert!(output.contains("mod outer {\n    use tokio::task::spawn;"));
+    // inner should have read_to_string
+    assert!(output.contains("mod inner {\n        use std::fs::read_to_string;"));
+    // deepest should have bail
+    assert!(output.contains("mod deepest {\n            use anyhow::bail;"));
+}
+
+#[test]
+fn test_same_import_in_different_modules() {
+    // Same path used in different modules should get imports in each module
+    let input = r#"
+mod mod_a {
+    fn foo() {
+        tokio::task::spawn(async {});
+    }
+}
+
+mod mod_b {
+    fn bar() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Both modules should have their own spawn import
+    assert!(output.contains("mod mod_a {\n    use tokio::task::spawn;"));
+    assert!(output.contains("mod mod_b {\n    use tokio::task::spawn;"));
+}
