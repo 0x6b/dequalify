@@ -777,3 +777,71 @@ mod mod_b {
     assert!(output.contains("mod mod_a {\n    use tokio::task::spawn;"));
     assert!(output.contains("mod mod_b {\n    use tokio::task::spawn;"));
 }
+
+#[test]
+fn test_mod_in_middle_of_file() {
+    // Mod can appear anywhere in a file - code before and after should work
+    let input = r#"
+fn before_mod() {
+    tokio::task::spawn(async {});
+}
+
+mod middle {
+    fn inside_mod() {
+        anyhow::bail!("error");
+    }
+}
+
+fn after_mod() {
+    std::fs::read_to_string("x");
+}
+"#;
+    let output = process_source(input, &[]);
+    // File-level uses should be at the top
+    assert!(output.contains("use std::fs::read_to_string;"));
+    assert!(output.contains("use tokio::task::spawn;"));
+    // Module use should be inside the module
+    assert!(output.contains("mod middle {\n    use anyhow::bail;"));
+    // All calls should be dequalified
+    assert!(output.contains("spawn(async"));
+    assert!(output.contains("bail!(\"error\")"));
+    assert!(output.contains("read_to_string(\"x\")"));
+}
+
+#[test]
+fn test_use_inside_function_not_dequalified() {
+    // `use` inside a function creates a local alias - paths using that alias
+    // should NOT be dequalified since the first segment is not a crate root
+    let input = r#"
+fn some_function() {
+    use tokio::task;
+    task::spawn(async {});
+}
+"#;
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(input.as_bytes()).unwrap();
+    let path = file.path().to_path_buf();
+    let changed = process_file(&path, &[], false).unwrap();
+    // No changes should be made - task is a local alias, not a crate
+    assert!(changed.is_none());
+}
+
+#[test]
+fn test_mixed_local_import_and_crate_path() {
+    // If there's a local import and a separate crate path, only the crate path
+    // should be dequalified
+    let input = r#"
+fn some_function() {
+    use tokio::task;
+    task::spawn(async {});  // uses local import, skip
+    std::fs::read_to_string("x");  // crate path, dequalify
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should have use for read_to_string
+    assert!(output.contains("use std::fs::read_to_string;"));
+    // task::spawn should remain unchanged
+    assert!(output.contains("task::spawn(async"));
+    // read_to_string should be dequalified
+    assert!(output.contains("read_to_string(\"x\")"));
+}

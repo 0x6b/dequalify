@@ -63,6 +63,9 @@ struct PathCollector<'a> {
     scope_infos: BTreeMap<String, ScopeInfo>,
     /// Line offsets for byte position calculation
     line_offsets: &'a LineOffsets,
+    /// Names imported via `use` statements anywhere in the file (including inside functions).
+    /// These names should not be treated as crate roots when encountered as path prefixes.
+    all_imported_names: BTreeSet<String>,
 }
 
 impl<'a> PathCollector<'a> {
@@ -74,6 +77,7 @@ impl<'a> PathCollector<'a> {
             scope_stack: Vec::new(),
             scope_infos: BTreeMap::new(),
             line_offsets,
+            all_imported_names: BTreeSet::new(),
         }
     }
 
@@ -81,9 +85,23 @@ impl<'a> PathCollector<'a> {
     fn current_scope(&self) -> String {
         self.scope_stack.join("::")
     }
+
+    /// Check if a name is imported via a `use` statement somewhere in the file.
+    /// Such names should not be treated as crate roots.
+    fn is_locally_imported(&self, name: &str) -> bool {
+        self.all_imported_names.contains(name)
+    }
 }
 
 impl Visit<'_> for PathCollector<'_> {
+    // Collect all imported names from `use` statements anywhere in the file.
+    // This includes `use` in functions, which create local aliases that shouldn't
+    // be treated as crate roots.
+    fn visit_item_use(&mut self, node: &syn::ItemUse) {
+        collect_use_idents(&node.tree, &mut self.all_imported_names);
+        visit::visit_item_use(self, node);
+    }
+
     fn visit_expr_call(&mut self, node: &ExprCall) {
         if let syn::Expr::Path(expr_path) = &*node.func
             && expr_path.qself.is_none()
@@ -103,11 +121,15 @@ impl Visit<'_> for PathCollector<'_> {
                 // Skip primitive types - they cannot be imported via `use`
                 let is_primitive_method = PRIMITIVE_TYPES.contains(&second_to_last.as_str());
 
+                // Skip if first segment is a locally imported name (not a crate root)
+                let is_local_import = self.is_locally_imported(&first_name);
+
                 if first_name != "Self"
                     && !first_char.is_uppercase()
                     && !second_to_last_char.is_uppercase()
                     && !is_primitive_method
                     && !self.ignore_roots.contains(&first_name)
+                    && !is_local_import
                 {
                     let full_str = path_to_string(path);
 
@@ -200,9 +222,13 @@ impl Visit<'_> for PathCollector<'_> {
             let first_name = first_ident.to_string();
             let first_char = first_name.chars().next().unwrap_or('a');
 
+            // Skip if first segment is a locally imported name (not a crate root)
+            let is_local_import = self.is_locally_imported(&first_name);
+
             if first_name != "Self"
                 && !first_char.is_uppercase()
                 && !self.ignore_roots.contains(&first_name)
+                && !is_local_import
             {
                 let full_str = path_to_string(path);
 
@@ -487,7 +513,7 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
                 .iter()
                 .map(|s| format!("{indent}{s}"))
                 .collect();
-            let use_block = "\n".to_string() + &indented_uses.join("\n");
+            let use_block = "\n".to_string() + &indented_uses.join("\n") + "\n";
             edits.push(Edit::Insert {
                 pos: scope_info.insert_pos,
                 text: use_block,
