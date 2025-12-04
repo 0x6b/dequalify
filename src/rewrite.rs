@@ -337,6 +337,71 @@ impl Visit<'_> for PathCollector<'_> {
         }
         visit::visit_macro(self, node);
     }
+
+    fn visit_type_path(&mut self, node: &syn::TypePath) {
+        // Skip qualified self types like <Foo as Bar>::Baz
+        if node.qself.is_some() {
+            visit::visit_type_path(self, node);
+            return;
+        }
+
+        let path = &node.path;
+        let segments = &path.segments;
+
+        // Only process qualified type paths (e.g., anyhow::Result, std::collections::HashMap)
+        if segments.len() >= 2 {
+            let first_ident = &segments[0].ident;
+            let first_name = first_ident.to_string();
+
+            // Skip paths that start with a locally imported internal name (crate/self/super).
+            if self.is_locally_imported_internal(&first_name) {
+                visit::visit_type_path(self, node);
+                return;
+            }
+
+            // Try to expand the path if the first segment is a file-level import.
+            let remaining: Vec<String> =
+                segments.iter().skip(1).map(|s| s.ident.to_string()).collect();
+            let (full_str, effective_first_name) =
+                if let Some(expanded) = self.expand_path(&first_name, &remaining) {
+                    let expanded_first =
+                        expanded.split("::").next().unwrap_or(&first_name).to_string();
+                    (expanded, expanded_first)
+                } else {
+                    (path_to_string(path), first_name.clone())
+                };
+
+            let first_char = effective_first_name.chars().next().unwrap_or('a');
+
+            // Get the last segment (the type name)
+            let last_segment = segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+
+            // Skip primitive types and Self
+            if effective_first_name != "Self"
+                && !first_char.is_uppercase()
+                && !PRIMITIVE_TYPES.contains(&last_segment.as_str())
+                && !self.ignore_roots.contains(&effective_first_name)
+            {
+                // Get span info for the path, excluding generic arguments.
+                // We use the start of the first segment and the end of the last segment's ident
+                // to avoid capturing generic parameters like <T>.
+                let start = segments.first().unwrap().ident.span().start();
+                let end = segments.last().unwrap().ident.span().end();
+
+                self.paths.insert(full_str.clone());
+
+                self.occurrences.push(PathOccurrence {
+                    full_path_str: full_str,
+                    start_line: start.line,
+                    start_col: start.column,
+                    end_line: end.line,
+                    end_col: end.column,
+                    scope: self.current_scope(),
+                });
+            }
+        }
+        visit::visit_type_path(self, node);
+    }
 }
 
 /// Represents a path's import strategy at a given level.

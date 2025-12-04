@@ -915,3 +915,76 @@ mod nested {
     // No changes should be made - super::commands is an internal import
     assert!(changed.is_none());
 }
+
+#[test]
+fn test_type_path_simple() {
+    // Simple type path should be dequalified
+    let input = r#"
+fn foo() -> anyhow::Result<()> {
+    Ok(())
+}
+"#;
+    let output = process_source(input, &[]);
+    assert!(output.contains("use anyhow::Result;"), "Should have use statement");
+    assert!(output.contains("Result<()>"), "Should preserve generic parameter");
+    // Check that the qualified path in the function signature is gone
+    assert!(!output.contains("-> anyhow::Result"), "Should not have qualified path in return type");
+}
+
+#[test]
+fn test_type_path_nested() {
+    // Nested type path like std::collections::HashMap
+    let input = r#"
+fn foo() -> std::collections::HashMap<String, i32> {
+    todo!()
+}
+"#;
+    let output = process_source(input, &[]);
+    assert!(output.contains("use std::collections::HashMap;"));
+    assert!(output.contains("HashMap<String, i32>"), "Should preserve generic parameters");
+}
+
+#[test]
+fn test_type_path_in_struct() {
+    // Type path in struct field
+    let input = r#"
+struct Foo {
+    bar: std::sync::Arc<String>,
+}
+"#;
+    let output = process_source(input, &[]);
+    assert!(output.contains("use std::sync::Arc;"));
+    assert!(output.contains("Arc<String>"));
+}
+
+#[test]
+fn test_type_path_multiple() {
+    // Multiple type paths in same function
+    let input = r#"
+fn foo(x: std::sync::Arc<String>) -> anyhow::Result<std::collections::HashMap<String, i32>> {
+    todo!()
+}
+"#;
+    let output = process_source(input, &[]);
+    assert!(output.contains("use anyhow::Result;"));
+    assert!(output.contains("use std::collections::HashMap;"));
+    assert!(output.contains("use std::sync::Arc;"));
+    assert!(output.contains("Arc<String>"));
+    assert!(output.contains("Result<HashMap<String, i32>>"));
+}
+
+#[test]
+fn test_type_path_with_function_call() {
+    // Mix of type paths and function calls
+    let input = r#"
+fn foo() -> anyhow::Result<()> {
+    tokio::task::spawn(async {});
+    Ok(())
+}
+"#;
+    let output = process_source(input, &[]);
+    assert!(output.contains("use anyhow::Result;"));
+    assert!(output.contains("use tokio::task::spawn;"));
+    assert!(output.contains("Result<()>"));
+    assert!(output.contains("spawn(async"));
+}
