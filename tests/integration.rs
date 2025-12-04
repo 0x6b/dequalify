@@ -988,3 +988,38 @@ fn foo() -> anyhow::Result<()> {
     assert!(output.contains("Result<()>"));
     assert!(output.contains("spawn(async"));
 }
+
+#[test]
+fn test_type_path_with_same_name_import() {
+    // When `use anyhow::anyhow;` is present, `anyhow::Error` should still
+    // dequalify to `use anyhow::Error;`, NOT `use anyhow::anyhow::Error;`
+    let input = r#"
+use anyhow::anyhow;
+
+impl FromStr for Config {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        if s.is_empty() {
+            return Err(anyhow!("empty string"));
+        }
+        Ok(Config)
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should add correct imports
+    assert!(
+        output.contains("use anyhow::Error;"),
+        "Should have `use anyhow::Error;`, got:\n{output}"
+    );
+    assert!(
+        output.contains("use anyhow::Result;"),
+        "Should have `use anyhow::Result;`, got:\n{output}"
+    );
+    // Should NOT have incorrect expanded path
+    assert!(
+        !output.contains("anyhow::anyhow::Error"),
+        "Should NOT have `anyhow::anyhow::Error`, got:\n{output}"
+    );
+}

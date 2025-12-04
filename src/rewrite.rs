@@ -108,13 +108,26 @@ impl<'a> PathCollector<'a> {
     /// Try to expand a path using import mappings.
     /// e.g., if `task` maps to `tokio::task`, then `task::spawn` expands to `tokio::task::spawn`.
     /// Returns the expanded path if the first segment is imported, otherwise None.
+    ///
+    /// However, if the first segment of the path matches the first segment of the expanded path
+    /// (e.g., `anyhow` in both `anyhow::Error` and `anyhow::anyhow`), we don't expand because
+    /// the user is referencing the crate directly, not the imported alias.
     fn expand_path(&self, first_segment: &str, remaining_segments: &[String]) -> Option<String> {
-        self.import_mappings.get(first_segment).map(|base_path| {
-            if remaining_segments.is_empty() {
+        self.import_mappings.get(first_segment).and_then(|base_path| {
+            // Check if the first segment of the base_path equals the lookup key.
+            // If so, we have a case like `use anyhow::anyhow;` where "anyhow" maps to "anyhow::anyhow".
+            // When we see `anyhow::Error`, we should NOT expand it to `anyhow::anyhow::Error`.
+            let base_first = base_path.split("::").next().unwrap_or("");
+            if base_first == first_segment && !remaining_segments.is_empty() {
+                // The path `anyhow::Error` refers to the crate, not the imported `anyhow::anyhow`
+                return None;
+            }
+
+            Some(if remaining_segments.is_empty() {
                 base_path.clone()
             } else {
                 format!("{base_path}::{}", remaining_segments.join("::"))
-            }
+            })
         })
     }
 }
