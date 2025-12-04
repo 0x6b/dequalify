@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Context, Result};
 use similar::{ChangeTag, TextDiff};
 use syn::{
-    ExprCall, File, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemStruct,
-    ItemTrait, ItemType, ItemUnion, Pat, Path as SynPath, UseTree, parse_file,
+    ExprCall, ExprClosure, File, ImplItemFn, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMod,
+    ItemStatic, ItemStruct, ItemTrait, ItemType, ItemUnion, ItemUse, Local, Macro, Pat, PatIdent,
+    Path as SynPath, TypePath, UseTree, parse_file,
     spanned::Spanned,
     visit::{
         Visit, {self},
@@ -112,7 +113,7 @@ impl<'a> PathCollector<'a> {
             if remaining_segments.is_empty() {
                 base_path.clone()
             } else {
-                format!("{}::{}", base_path, remaining_segments.join("::"))
+                format!("{base_path}::{}", remaining_segments.join("::"))
             }
         })
     }
@@ -123,7 +124,7 @@ impl Visit<'_> for PathCollector<'_> {
     // All imports (file-level and block-level) are stored in `import_mappings` for path expansion.
     // Block-level imports of internal paths (crate/self/super) are additionally tracked to skip
     // them.
-    fn visit_item_use(&mut self, node: &syn::ItemUse) {
+    fn visit_item_use(&mut self, node: &ItemUse) {
         // Always collect mappings for path expansion
         collect_use_mappings(&node.tree, &Vec::new(), &mut self.import_mappings);
 
@@ -142,14 +143,14 @@ impl Visit<'_> for PathCollector<'_> {
     }
 
     // Track when entering impl method bodies
-    fn visit_impl_item_fn(&mut self, node: &syn::ImplItemFn) {
+    fn visit_impl_item_fn(&mut self, node: &ImplItemFn) {
         self.block_depth += 1;
         visit::visit_impl_item_fn(self, node);
         self.block_depth -= 1;
     }
 
     // Track when entering closures
-    fn visit_expr_closure(&mut self, node: &syn::ExprClosure) {
+    fn visit_expr_closure(&mut self, node: &ExprClosure) {
         self.block_depth += 1;
         visit::visit_expr_closure(self, node);
         self.block_depth -= 1;
@@ -283,7 +284,7 @@ impl Visit<'_> for PathCollector<'_> {
         }
     }
 
-    fn visit_macro(&mut self, node: &syn::Macro) {
+    fn visit_macro(&mut self, node: &Macro) {
         let path = &node.path;
         let segments = &path.segments;
 
@@ -338,7 +339,7 @@ impl Visit<'_> for PathCollector<'_> {
         visit::visit_macro(self, node);
     }
 
-    fn visit_type_path(&mut self, node: &syn::TypePath) {
+    fn visit_type_path(&mut self, node: &TypePath) {
         // Skip qualified self types like <Foo as Bar>::Baz
         if node.qself.is_some() {
             visit::visit_type_path(self, node);
@@ -362,14 +363,14 @@ impl Visit<'_> for PathCollector<'_> {
             // Try to expand the path if the first segment is a file-level import.
             let remaining: Vec<String> =
                 segments.iter().skip(1).map(|s| s.ident.to_string()).collect();
-            let (full_str, effective_first_name) =
-                if let Some(expanded) = self.expand_path(&first_name, &remaining) {
-                    let expanded_first =
-                        expanded.split("::").next().unwrap_or(&first_name).to_string();
-                    (expanded, expanded_first)
-                } else {
-                    (path_to_string(path), first_name.clone())
-                };
+            let (full_str, effective_first_name) = if let Some(expanded) =
+                self.expand_path(&first_name, &remaining)
+            {
+                let expanded_first = expanded.split("::").next().unwrap_or(&first_name).to_string();
+                (expanded, expanded_first)
+            } else {
+                (path_to_string(path), first_name.clone())
+            };
 
             let first_char = effective_first_name.chars().next().unwrap_or('a');
 
@@ -909,11 +910,11 @@ fn collect_local_idents(ast: &File) -> BTreeSet<String> {
         set: &'a mut BTreeSet<String>,
     }
     impl VisitMut for LocalBindingCollector<'_> {
-        fn visit_local_mut(&mut self, node: &mut syn::Local) {
+        fn visit_local_mut(&mut self, node: &mut Local) {
             collect_pattern_idents(&node.pat, self.set);
             visit_local_mut(self, node);
         }
-        fn visit_pat_ident_mut(&mut self, node: &mut syn::PatIdent) {
+        fn visit_pat_ident_mut(&mut self, node: &mut PatIdent) {
             self.set.insert(node.ident.to_string());
             visit_pat_ident_mut(self, node);
         }

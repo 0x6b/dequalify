@@ -136,7 +136,7 @@ fn main() -> Result<()> {
                 }
             }
             Ok(None) => {}
-            Err(e) => eprintln!("error processing {}: {}", path.display(), e),
+            Err(e) => eprintln!("error processing {}: {e}", path.display()),
         });
 
     // Print diffs sorted by path (deterministic output)
