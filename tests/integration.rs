@@ -1063,3 +1063,153 @@ impl FromStr for Config {
         "Should keep `fmt::Result` qualified, got:\n{output}"
     );
 }
+
+#[test]
+fn test_cfg_function_import() {
+    // Functions with #[cfg] should generate imports with matching #[cfg]
+    let input = r#"
+#[cfg(unix)]
+fn unix_only() {
+    tokio::task::spawn(async {});
+}
+
+fn always() {
+    std::fs::read_to_string("x");
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should have cfg-gated import for spawn
+    assert!(
+        output.contains("#[cfg(unix)]\nuse tokio::task::spawn;"),
+        "Should have cfg-gated import, got:\n{output}"
+    );
+    // Should have non-gated import for read_to_string
+    assert!(
+        output.contains("use std::fs::read_to_string;"),
+        "Should have non-gated import, got:\n{output}"
+    );
+    // The cfg-gated import should NOT be on read_to_string
+    assert!(
+        !output.contains("#[cfg(unix)]\nuse std::fs::read_to_string;"),
+        "read_to_string should not be cfg-gated, got:\n{output}"
+    );
+}
+
+#[test]
+fn test_cfg_mod_import() {
+    // Modules with #[cfg] should generate imports with matching #[cfg]
+    let input = r#"
+#[cfg(test)]
+mod tests {
+    fn test_foo() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // The import inside the mod should have cfg(test)
+    assert!(
+        output.contains("#[cfg(test)]\n    use tokio::task::spawn;"),
+        "Should have cfg-gated import inside mod, got:\n{output}"
+    );
+}
+
+#[test]
+fn test_cfg_impl_block_import() {
+    // Impl blocks with #[cfg] should generate imports with matching #[cfg]
+    let input = r#"
+struct Foo;
+
+#[cfg(feature = "async")]
+impl Foo {
+    fn bar() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should have cfg-gated import
+    assert!(
+        output.contains("#[cfg(feature = \"async\")]\nuse tokio::task::spawn;"),
+        "Should have cfg-gated import for impl block, got:\n{output}"
+    );
+}
+
+#[test]
+fn test_multiple_cfg_attrs() {
+    // Multiple cfg attributes should all be applied
+    let input = r#"
+#[cfg(unix)]
+mod platform {
+    #[cfg(feature = "async")]
+    fn async_unix() {
+        tokio::task::spawn(async {});
+    }
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should have both cfg attributes
+    assert!(
+        output.contains("#[cfg(feature = \"async\")]") && output.contains("#[cfg(unix)]"),
+        "Should have both cfg attributes, got:\n{output}"
+    );
+}
+
+#[test]
+fn test_same_import_different_cfg() {
+    // Same import used in different cfg contexts should generate separate imports
+    let input = r#"
+#[cfg(unix)]
+fn unix_spawn() {
+    tokio::task::spawn(async {});
+}
+
+#[cfg(windows)]
+fn windows_spawn() {
+    tokio::task::spawn(async {});
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should have cfg(unix) import
+    assert!(
+        output.contains("#[cfg(unix)]\nuse tokio::task::spawn;"),
+        "Should have unix cfg-gated import, got:\n{output}"
+    );
+    // Should have cfg(windows) import
+    assert!(
+        output.contains("#[cfg(windows)]\nuse tokio::task::spawn;"),
+        "Should have windows cfg-gated import, got:\n{output}"
+    );
+}
+
+#[test]
+fn test_cfg_and_non_cfg_same_import() {
+    // Same import used both with and without cfg should generate both
+    let input = r#"
+fn always() {
+    tokio::task::spawn(async {});
+}
+
+#[cfg(test)]
+fn test_only() {
+    tokio::task::spawn(async {});
+}
+"#;
+    let output = process_source(input, &[]);
+    // Should have non-gated import (from always())
+    let lines: Vec<&str> = output.lines().collect();
+    let has_non_gated = lines.iter().any(|line| {
+        line.trim() == "use tokio::task::spawn;"
+            && !lines
+                .iter()
+                .position(|l| *l == *line)
+                .map(|i| i > 0 && lines[i - 1].contains("#[cfg"))
+                .unwrap_or(false)
+    });
+    // Should have cfg(test) gated import (from test_only())
+    assert!(
+        output.contains("#[cfg(test)]\nuse tokio::task::spawn;"),
+        "Should have cfg(test) gated import, got:\n{output}"
+    );
+    assert!(has_non_gated, "Should have non-gated import, got:\n{output}");
+}

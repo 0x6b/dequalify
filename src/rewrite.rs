@@ -28,7 +28,8 @@ fn extract_cfg_attrs(attrs: &[Attribute]) -> Vec<String> {
         .iter()
         .filter_map(|attr| {
             if attr.path().is_ident("cfg") {
-                Some(format!("cfg{}", attr.meta.require_list().ok()?.tokens.to_string()))
+                let list = attr.meta.require_list().ok()?;
+                Some(format!("cfg({})", list.tokens))
             } else {
                 None
             }
