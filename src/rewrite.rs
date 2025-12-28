@@ -55,6 +55,10 @@ struct PathOccurrence {
     end_col: usize,
     /// The scope this occurrence is in ("" for file level, "tests" for mod tests, etc.)
     scope: String,
+    /// The #[cfg(...)] attributes that apply to this occurrence.
+    /// Multiple cfg attributes are combined (all must be satisfied).
+    /// Empty means no cfg restriction.
+    cfg_attrs: Vec<String>,
 }
 
 /// Information about a scope (file level or module) for use statement insertion.
