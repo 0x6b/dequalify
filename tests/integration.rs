@@ -1137,7 +1137,7 @@ impl Foo {
 
 #[test]
 fn test_multiple_cfg_attrs() {
-    // Multiple cfg attributes should all be applied
+    // Multiple cfg attributes should all be stacked on the same use statement
     let input = r#"
 #[cfg(unix)]
 mod platform {
@@ -1148,10 +1148,11 @@ mod platform {
 }
 "#;
     let output = process_source(input, &[]);
-    // Should have both cfg attributes
+    // Both cfg attributes should be stacked on the same use statement
+    // The order is sorted alphabetically: cfg(feature = "async") before cfg(unix)
     assert!(
-        output.contains("#[cfg(feature = \"async\")]") && output.contains("#[cfg(unix)]"),
-        "Should have both cfg attributes, got:\n{output}"
+        output.contains("#[cfg(feature = \"async\")]\n    #[cfg(unix)]\n    use tokio::task::spawn;"),
+        "Should have both cfg attributes stacked on use statement, got:\n{output}"
     );
 }
 

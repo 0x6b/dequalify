@@ -762,11 +762,12 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
                         use_blocks.push(format!("{indent}{stmt}"));
                     }
                 } else {
-                    // Has cfg attrs - wrap each use statement with #[cfg(...)]
-                    for cfg in cfg_attrs {
-                        for stmt in &sorted_stmts {
-                            use_blocks.push(format!("{indent}#[{cfg}]\n{indent}{stmt}"));
-                        }
+                    // Has cfg attrs - stack all cfg attributes on each use statement
+                    // e.g., #[cfg(unix)]\n#[cfg(feature = "async")]\nuse foo;
+                    let cfg_prefix: String =
+                        cfg_attrs.iter().map(|cfg| format!("{indent}#[{cfg}]\n")).collect();
+                    for stmt in &sorted_stmts {
+                        use_blocks.push(format!("{cfg_prefix}{indent}{stmt}"));
                     }
                 }
             }
