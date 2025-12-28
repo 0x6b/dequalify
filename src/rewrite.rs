@@ -724,19 +724,19 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
         // Resolve imports for this scope
         let strategies = resolve_all_imports(&scope_paths_vec, &existing_idents);
 
-        // Build use statements and replacements for this scope
-        let mut use_statements: Vec<String> = Vec::new();
+        // Build use statements grouped by cfg attributes
+        // Key: sorted cfg attrs joined (empty string for no cfg)
+        // Value: list of use statements for that cfg group
+        let mut use_by_cfg: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
 
         for occ in occurrences {
             let Some(strategy) = strategies.get(&occ.full_path_str) else {
                 continue;
             };
 
-            // Add use statement (will be deduplicated later)
+            // Add use statement to appropriate cfg group
             let use_stmt = strategy.use_statement();
-            if !use_statements.contains(&use_stmt) {
-                use_statements.push(use_stmt);
-            }
+            use_by_cfg.entry(occ.cfg_attrs.clone()).or_default().insert(use_stmt);
 
             // Create replacement for this occurrence
             let start_byte = line_offsets.line_col_to_byte(occ.start_line, occ.start_col);
@@ -747,15 +747,33 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
             }
         }
 
-        // Create use block insertion for this scope
-        if !use_statements.is_empty() {
-            use_statements.sort();
+        // Create use block insertion for this scope, grouped by cfg
+        if !use_by_cfg.is_empty() {
             let indent = &scope_info.indent;
-            // Add indentation to each use statement
-            let indented_uses: Vec<String> =
-                use_statements.iter().map(|s| format!("{indent}{s}")).collect();
-            let use_block = "\n".to_string() + &indented_uses.join("\n") + "\n";
-            edits.push(Edit::Insert { pos: scope_info.insert_pos, text: use_block });
+            let mut use_blocks: Vec<String> = Vec::new();
+
+            for (cfg_attrs, use_stmts) in &use_by_cfg {
+                let sorted_stmts: Vec<&String> = use_stmts.iter().collect();
+
+                if cfg_attrs.is_empty() {
+                    // No cfg - just add use statements directly
+                    for stmt in sorted_stmts {
+                        use_blocks.push(format!("{indent}{stmt}"));
+                    }
+                } else {
+                    // Has cfg attrs - wrap each use statement with #[cfg(...)]
+                    for cfg in cfg_attrs {
+                        for stmt in &sorted_stmts {
+                            use_blocks.push(format!("{indent}#[{cfg}]\n{indent}{stmt}"));
+                        }
+                    }
+                }
+            }
+
+            if !use_blocks.is_empty() {
+                let use_block = "\n".to_string() + &use_blocks.join("\n") + "\n";
+                edits.push(Edit::Insert { pos: scope_info.insert_pos, text: use_block });
+            }
         }
     }
 
