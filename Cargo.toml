@@ -1,6 +1,6 @@
 [package]
 name = "cargo-dequalify"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "A Rust refactoring tool that rewrites fully-qualified function calls into imported short names"
 license = "MIT"
