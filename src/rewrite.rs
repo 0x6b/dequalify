@@ -10,579 +10,511 @@ use similar::{ChangeTag, TextDiff};
 use syn::{
     Attribute, Expr, ExprCall, ExprClosure, File, ImplItemFn, Item, ItemConst, ItemEnum, ItemFn,
     ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemType, ItemUnion, ItemUse, Local,
-    Macro, Pat, Path as SynPath, TypePath, UseTree, parse_file,
+    Macro, Pat, Path as SynPath, Signature, TypePath, UseTree, parse_file,
     spanned::Spanned,
-    visit::{Visit, self},
+    visit::{self, Visit, visit_pat},
 };
 
-const PRIMITIVE_TYPES: &[&str] = &[
+const PRIMITIVES: &[&str] = &[
     "bool", "char", "str", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64",
     "u128", "usize", "f32", "f64",
 ];
-
-const PRELUDE_TYPES: &[&str] = &["Option", "Result", "Box", "String", "Vec"];
-
-const FORMAT_MACROS: &[&str] = &[
-    "println", "print", "eprintln", "eprint", "format", "format_args", "write", "writeln",
-    "panic", "unreachable", "todo", "unimplemented", "trace", "debug", "info", "warn", "error",
+const PRELUDE: &[&str] = &["Option", "Result", "Box", "String", "Vec"];
+const FMT_MACROS: &[&str] = &[
+    "println",
+    "print",
+    "eprintln",
+    "eprint",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
 ];
 
-#[derive(Clone, Debug)]
-struct PathOccurrence {
-    full_path_str: String,
-    start_line: usize,
-    start_col: usize,
-    end_line: usize,
-    end_col: usize,
+#[derive(Clone)]
+struct Occurrence {
+    path: String,
+    start: (usize, usize),
+    end: (usize, usize),
     scope: String,
-    cfg_attrs: Vec<String>,
-    local_bindings: BTreeSet<String>,
+    cfg: Vec<String>,
+    locals: BTreeSet<String>,
 }
 
-#[derive(Debug)]
 struct ScopeInfo {
-    insert_pos: usize,
-    imported_idents: BTreeSet<String>,
+    pos: usize,
+    imports: BTreeSet<String>,
     indent: String,
 }
 
-struct PathCollector<'a> {
+struct Collector<'a> {
     paths: BTreeSet<String>,
-    occurrences: Vec<PathOccurrence>,
-    ignore_roots: &'a BTreeSet<String>,
-    scope_stack: Vec<String>,
-    scope_infos: BTreeMap<String, ScopeInfo>,
-    line_offsets: &'a LineOffsets,
-    import_mappings: BTreeMap<String, String>,
-    locally_imported_internal_names: BTreeSet<String>,
-    block_depth: usize,
-    cfg_stack: Vec<String>,
-    local_binding_stack: Vec<BTreeSet<String>>,
+    occs: Vec<Occurrence>,
+    ignore: &'a BTreeSet<String>,
+    scope: Vec<String>,
+    scopes: BTreeMap<String, ScopeInfo>,
+    lines: &'a Lines,
+    mappings: BTreeMap<String, String>,
+    internal: BTreeSet<String>,
+    depth: usize,
+    cfg: Vec<String>,
+    bindings: Vec<BTreeSet<String>>,
 }
 
-impl<'a> PathCollector<'a> {
-    fn new(ignore_roots: &'a BTreeSet<String>, line_offsets: &'a LineOffsets) -> Self {
+impl<'a> Collector<'a> {
+    fn new(ignore: &'a BTreeSet<String>, lines: &'a Lines) -> Self {
         Self {
             paths: BTreeSet::new(),
-            occurrences: Vec::new(),
-            ignore_roots,
-            scope_stack: Vec::new(),
-            scope_infos: BTreeMap::new(),
-            line_offsets,
-            import_mappings: BTreeMap::new(),
-            locally_imported_internal_names: BTreeSet::new(),
-            block_depth: 0,
-            cfg_stack: Vec::new(),
-            local_binding_stack: Vec::new(),
+            occs: Vec::new(),
+            ignore,
+            scope: Vec::new(),
+            scopes: BTreeMap::new(),
+            lines,
+            mappings: BTreeMap::new(),
+            internal: BTreeSet::new(),
+            depth: 0,
+            cfg: Vec::new(),
+            bindings: Vec::new(),
         }
     }
 
-    fn current_cfg_attrs(&self) -> Vec<String> {
-        let mut attrs: Vec<_> = self.cfg_stack.iter().cloned().collect();
-        attrs.sort();
-        attrs.dedup();
-        attrs
+    fn cur_cfg(&self) -> Vec<String> {
+        let mut c = self.cfg.clone();
+        c.sort();
+        c.dedup();
+        c
+    }
+    fn cur_scope(&self) -> String {
+        self.scope.join("::")
+    }
+    fn cur_locals(&self) -> BTreeSet<String> {
+        self.bindings.iter().flatten().cloned().collect()
     }
 
-    fn current_scope(&self) -> String {
-        self.scope_stack.join("::")
-    }
-
-    fn current_local_bindings(&self) -> BTreeSet<String> {
-        self.local_binding_stack.iter().flatten().cloned().collect()
-    }
-
-    fn add_local_binding(&mut self, name: String) {
-        if let Some(current) = self.local_binding_stack.last_mut() {
-            current.insert(name);
-        }
-    }
-
-    fn expand_path(&self, first_segment: &str, remaining: &[String]) -> Option<String> {
-        self.import_mappings.get(first_segment).and_then(|base| {
-            let base_first = base.split("::").next().unwrap_or("");
-            if base_first == first_segment && !remaining.is_empty() {
-                return None;
-            }
-            Some(if remaining.is_empty() {
-                base.clone()
-            } else {
-                format!("{base}::{}", remaining.join("::"))
+    fn expand(&self, first: &str, rest: &[String]) -> Option<String> {
+        self.mappings.get(first).and_then(|base| {
+            (base.split("::").next()? != first || rest.is_empty()).then(|| {
+                if rest.is_empty() { base.clone() } else { format!("{base}::{}", rest.join("::")) }
             })
         })
     }
 
-    fn with_cfg_attrs<F>(&mut self, attrs: &[Attribute], f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        let cfg_attrs = extract_cfg_attrs(attrs);
-        let cfg_count = cfg_attrs.len();
-        self.cfg_stack.extend(cfg_attrs);
+    fn with_cfg<F: FnOnce(&mut Self)>(&mut self, attrs: &[Attribute], f: F) {
+        let cfgs = extract_cfg(attrs);
+        let n = cfgs.len();
+        self.cfg.extend(cfgs);
         f(self);
-        self.cfg_stack.truncate(self.cfg_stack.len() - cfg_count);
+        self.cfg.truncate(self.cfg.len() - n);
     }
 
-    fn with_fn_scope<F>(&mut self, sig: &syn::Signature, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        self.block_depth += 1;
-        let mut bindings = BTreeSet::new();
-        for input in &sig.inputs {
-            if let syn::FnArg::Typed(pat_ty) = input {
-                collect_pattern_idents(&pat_ty.pat, &mut bindings);
+    fn with_fn<F: FnOnce(&mut Self)>(&mut self, sig: &Signature, f: F) {
+        self.depth += 1;
+        let mut b = BTreeSet::new();
+        for i in &sig.inputs {
+            if let syn::FnArg::Typed(t) = i {
+                collect_pat(&t.pat, &mut b);
             }
         }
-        self.local_binding_stack.push(bindings);
+        self.bindings.push(b);
         f(self);
-        self.local_binding_stack.pop();
-        self.block_depth -= 1;
+        self.bindings.pop();
+        self.depth -= 1;
     }
 
-    fn record_qualified_path(
+    fn record(
         &mut self,
         path: &SynPath,
-        start_line: usize,
-        start_col: usize,
-        end_line: usize,
-        end_col: usize,
+        start: (usize, usize),
+        end: (usize, usize),
         is_type: bool,
     ) {
-        let segments = &path.segments;
-        if segments.len() < 2 {
+        let segs = &path.segments;
+        if segs.len() < 2 {
+            return;
+        }
+        let first = segs[0].ident.to_string();
+        if self.internal.contains(&first) {
             return;
         }
 
-        let first_name = segments[0].ident.to_string();
+        let rest: Vec<String> = segs.iter().skip(1).map(|s| s.ident.to_string()).collect();
+        let (full, eff) = self
+            .expand(&first, &rest)
+            .map(|e| (e.clone(), e.split("::").next().unwrap_or(&first).to_string()))
+            .unwrap_or_else(|| (path_str(path), first));
 
-        if self.locally_imported_internal_names.contains(&first_name) {
+        let fc = eff.chars().next().unwrap_or('a');
+        if eff == "Self" || fc.is_uppercase() || self.ignore.contains(&eff) {
             return;
         }
 
-        let remaining: Vec<String> = segments.iter().skip(1).map(|s| s.ident.to_string()).collect();
-        let (full_str, effective_first) = match self.expand_path(&first_name, &remaining) {
-            Some(expanded) => {
-                let ef = expanded.split("::").next().unwrap_or(&first_name).to_string();
-                (expanded, ef)
-            }
-            None => (path_to_string(path), first_name),
-        };
-
-        let first_char = effective_first.chars().next().unwrap_or('a');
-        if effective_first == "Self" || first_char.is_uppercase() {
-            return;
-        }
-        if self.ignore_roots.contains(&effective_first) {
-            return;
-        }
-
-        let expanded_segments: Vec<&str> = full_str.split("::").collect();
-
+        let parts: Vec<&str> = full.split("::").collect();
         if !is_type {
-            let second_to_last = expanded_segments
-                .get(expanded_segments.len().saturating_sub(2))
-                .unwrap_or(&"");
-            let stl_char = second_to_last.chars().next().unwrap_or('a');
-            if stl_char.is_uppercase() || PRIMITIVE_TYPES.contains(second_to_last) {
+            let stl = parts.get(parts.len().saturating_sub(2)).unwrap_or(&"");
+            if stl.chars().next().unwrap_or('a').is_uppercase() || PRIMITIVES.contains(stl) {
                 return;
             }
         } else {
-            let last = segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
-            if PRIMITIVE_TYPES.contains(&last.as_str()) {
+            let last = segs.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            if PRIMITIVES.contains(&last.as_str()) {
                 return;
             }
         }
 
-        self.paths.insert(full_str.clone());
-        self.occurrences.push(PathOccurrence {
-            full_path_str: full_str,
-            start_line,
-            start_col,
-            end_line,
-            end_col,
-            scope: self.current_scope(),
-            cfg_attrs: self.current_cfg_attrs(),
-            local_bindings: self.current_local_bindings(),
+        self.paths.insert(full.clone());
+        self.occs.push(Occurrence {
+            path: full,
+            start,
+            end,
+            scope: self.cur_scope(),
+            cfg: self.cur_cfg(),
+            locals: self.cur_locals(),
         });
     }
 
-    fn visit_format_macro_args(&mut self, node: &Macro) {
-        use syn::parse::Parser;
-        use syn::punctuated::Punctuated;
-        use syn::Token;
-
-        let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
-        if let Ok(args) = parser.parse2(node.tokens.clone()) {
-            for arg in args.into_iter().skip(1) {
-                self.visit_expr(&arg);
+    fn visit_fmt_args(&mut self, m: &Macro) {
+        use syn::{Token, parse::Parser, punctuated::Punctuated};
+        if let Ok(args) = Punctuated::<Expr, Token![,]>::parse_terminated.parse2(m.tokens.clone()) {
+            for a in args.into_iter().skip(1) {
+                self.visit_expr(&a);
             }
         }
     }
 }
 
-impl Visit<'_> for PathCollector<'_> {
-    fn visit_item_use(&mut self, node: &ItemUse) {
-        collect_use_mappings(&node.tree, &[], &mut self.import_mappings);
-        if self.block_depth > 0 && is_internal_use_tree(&node.tree) {
-            collect_use_idents(&node.tree, &mut self.locally_imported_internal_names);
+impl Visit<'_> for Collector<'_> {
+    fn visit_item_use(&mut self, n: &ItemUse) {
+        collect_mappings(&n.tree, &[], &mut self.mappings);
+        if self.depth > 0 && is_internal(&n.tree) {
+            collect_idents(&n.tree, &mut self.internal);
         }
-        visit::visit_item_use(self, node);
+        visit::visit_item_use(self, n);
     }
 
-    fn visit_item_fn(&mut self, node: &syn::ItemFn) {
-        self.with_cfg_attrs(&node.attrs, |this| {
-            this.with_fn_scope(&node.sig, |this| visit::visit_item_fn(this, node));
-        });
+    fn visit_item_fn(&mut self, n: &ItemFn) {
+        self.with_cfg(&n.attrs, |s| s.with_fn(&n.sig, |s| visit::visit_item_fn(s, n)));
     }
 
-    fn visit_impl_item_fn(&mut self, node: &ImplItemFn) {
-        self.with_cfg_attrs(&node.attrs, |this| {
-            this.with_fn_scope(&node.sig, |this| visit::visit_impl_item_fn(this, node));
-        });
+    fn visit_impl_item_fn(&mut self, n: &ImplItemFn) {
+        self.with_cfg(&n.attrs, |s| s.with_fn(&n.sig, |s| visit::visit_impl_item_fn(s, n)));
     }
 
-    fn visit_expr_closure(&mut self, node: &ExprClosure) {
-        self.block_depth += 1;
-        let mut bindings = BTreeSet::new();
-        for input in &node.inputs {
-            collect_pattern_idents(input, &mut bindings);
+    fn visit_expr_closure(&mut self, n: &ExprClosure) {
+        self.depth += 1;
+        let mut b = BTreeSet::new();
+        for i in &n.inputs {
+            collect_pat(i, &mut b);
         }
-        self.local_binding_stack.push(bindings);
-        visit::visit_expr_closure(self, node);
-        self.local_binding_stack.pop();
-        self.block_depth -= 1;
+        self.bindings.push(b);
+        visit::visit_expr_closure(self, n);
+        self.bindings.pop();
+        self.depth -= 1;
     }
 
-    fn visit_local(&mut self, node: &Local) {
-        if let Some(init) = &node.init {
+    fn visit_local(&mut self, n: &Local) {
+        if let Some(init) = &n.init {
             self.visit_expr(&init.expr);
-            if let Some((_, else_branch)) = &init.diverge {
-                self.visit_expr(else_branch);
+            if let Some((_, e)) = &init.diverge {
+                self.visit_expr(e);
             }
         }
-        let mut bindings = BTreeSet::new();
-        collect_pattern_idents(&node.pat, &mut bindings);
-        for name in bindings {
-            self.add_local_binding(name);
-        }
-        visit::visit_pat(self, &node.pat);
-    }
-
-    fn visit_item_impl(&mut self, node: &ItemImpl) {
-        self.with_cfg_attrs(&node.attrs, |this| visit::visit_item_impl(this, node));
-    }
-
-    fn visit_expr_call(&mut self, node: &ExprCall) {
-        if let syn::Expr::Path(expr_path) = &*node.func {
-            if expr_path.qself.is_none() {
-                let span = expr_path.span();
-                let start = span.start();
-                let end = span.end();
-                self.record_qualified_path(
-                    &expr_path.path,
-                    start.line,
-                    start.column,
-                    end.line,
-                    end.column,
-                    false,
-                );
+        let mut b = BTreeSet::new();
+        collect_pat(&n.pat, &mut b);
+        for name in b {
+            if let Some(c) = self.bindings.last_mut() {
+                c.insert(name);
             }
         }
-        visit::visit_expr_call(self, node);
+        visit_pat(self, &n.pat);
     }
 
-    fn visit_item_mod(&mut self, node: &ItemMod) {
-        self.with_cfg_attrs(&node.attrs, |this| {
-            if let Some((brace, items)) = &node.content {
-                let mod_name = node.ident.to_string();
-                this.scope_stack.push(mod_name);
-                let current_scope = this.current_scope();
+    fn visit_item_impl(&mut self, n: &ItemImpl) {
+        self.with_cfg(&n.attrs, |s| visit::visit_item_impl(s, n));
+    }
 
-                let mut last_use_line: Option<usize> = None;
-                let mut imported_idents = BTreeSet::new();
-                for item in items {
-                    if let Item::Use(item_use) = item {
-                        last_use_line = Some(item_use.span().end().line);
-                        collect_use_idents(&item_use.tree, &mut imported_idents);
+    fn visit_expr_call(&mut self, n: &ExprCall) {
+        if let syn::Expr::Path(p) = &*n.func
+            && p.qself.is_none()
+        {
+            let s = p.span();
+            let (st, en) = (s.start(), s.end());
+            self.record(&p.path, (st.line, st.column), (en.line, en.column), false);
+        }
+        visit::visit_expr_call(self, n);
+    }
+
+    fn visit_item_mod(&mut self, n: &ItemMod) {
+        self.with_cfg(&n.attrs, |s| {
+            if let Some((brace, items)) = &n.content {
+                s.scope.push(n.ident.to_string());
+                let scope = s.cur_scope();
+                let mut last_use = None;
+                let mut imports = BTreeSet::new();
+                for i in items {
+                    if let Item::Use(u) = i {
+                        last_use = Some(u.span().end().line);
+                        collect_idents(&u.tree, &mut imports);
                     }
                 }
-
                 let indent = items
                     .first()
                     .map(|i| " ".repeat(i.span().start().column))
-                    .unwrap_or_else(|| " ".repeat(4 * this.scope_stack.len()));
-
-                let insert_pos = last_use_line
-                    .map(|line| this.line_offsets.line_end_byte(line))
-                    .unwrap_or_else(|| this.line_offsets.line_end_byte(brace.span.open().end().line));
-
-                this.scope_infos.insert(current_scope, ScopeInfo { insert_pos, imported_idents, indent });
-                visit::visit_item_mod(this, node);
-                this.scope_stack.pop();
+                    .unwrap_or(" ".repeat(4 * s.scope.len()));
+                let pos = last_use
+                    .map(|l| s.lines.end(l))
+                    .unwrap_or_else(|| s.lines.end(brace.span.open().end().line));
+                s.scopes.insert(scope, ScopeInfo { pos, imports, indent });
+                visit::visit_item_mod(s, n);
+                s.scope.pop();
             } else {
-                visit::visit_item_mod(this, node);
+                visit::visit_item_mod(s, n);
             }
         });
     }
 
-    fn visit_macro(&mut self, node: &Macro) {
-        let segments = &node.path.segments;
-        if segments.len() >= 2 {
-            let span = node.path.segments.span();
-            let start = span.start();
-            let end = span.end();
-            self.record_qualified_path(&node.path, start.line, start.column, end.line, end.column, false);
+    fn visit_macro(&mut self, n: &Macro) {
+        let segs = &n.path.segments;
+        if segs.len() >= 2 {
+            let s = segs.span();
+            let (st, en) = (s.start(), s.end());
+            self.record(&n.path, (st.line, st.column), (en.line, en.column), false);
         }
-        if segments.len() == 1 {
-            let macro_name = segments[0].ident.to_string();
-            if FORMAT_MACROS.contains(&macro_name.as_str()) {
-                self.visit_format_macro_args(node);
-            }
+        if segs.len() == 1 && FMT_MACROS.contains(&segs[0].ident.to_string().as_str()) {
+            self.visit_fmt_args(n);
         }
-        visit::visit_macro(self, node);
+        visit::visit_macro(self, n);
     }
 
-    fn visit_type_path(&mut self, node: &TypePath) {
-        if node.qself.is_none() && node.path.segments.len() >= 2 {
-            let start = node.path.segments.first().unwrap().ident.span().start();
-            let end = node.path.segments.last().unwrap().ident.span().end();
-            self.record_qualified_path(&node.path, start.line, start.column, end.line, end.column, true);
+    fn visit_type_path(&mut self, n: &TypePath) {
+        if n.qself.is_none() && n.path.segments.len() >= 2 {
+            let st = n.path.segments.first().unwrap().ident.span().start();
+            let en = n.path.segments.last().unwrap().ident.span().end();
+            self.record(&n.path, (st.line, st.column), (en.line, en.column), true);
         }
-        visit::visit_type_path(self, node);
+        visit::visit_type_path(self, n);
     }
 }
 
-fn extract_cfg_attrs(attrs: &[Attribute]) -> Vec<String> {
+fn extract_cfg(attrs: &[Attribute]) -> Vec<String> {
     attrs
         .iter()
-        .filter_map(|attr| {
-            attr.path().is_ident("cfg").then(|| {
-                attr.meta.require_list().ok().map(|list| format!("cfg({})", list.tokens))
-            })?
+        .filter_map(|a| {
+            a.path()
+                .is_ident("cfg")
+                .then(|| a.meta.require_list().ok().map(|l| format!("cfg({})", l.tokens)))?
         })
         .collect()
 }
 
 #[derive(Clone)]
-struct ImportStrategy {
-    full_path: String,
-    segments: Vec<String>,
-    import_len: usize,
-    already_imported: bool,
+struct Strategy {
+    full: String,
+    segs: Vec<String>,
+    len: usize,
+    exists: bool,
 }
 
-impl ImportStrategy {
-    fn new(full_path: &str) -> Self {
-        let segments: Vec<String> = full_path.split("::").map(String::from).collect();
-        let import_len = segments.len();
-        Self { full_path: full_path.to_string(), segments, import_len, already_imported: false }
+impl Strategy {
+    fn new(p: &str) -> Self {
+        let segs: Vec<_> = p.split("::").map(String::from).collect();
+        Self {
+            full: p.into(),
+            len: segs.len(),
+            segs,
+            exists: false,
+        }
     }
-
-    fn import_ident(&self) -> &str {
-        &self.segments[self.import_len - 1]
+    fn ident(&self) -> &str {
+        &self.segs[self.len - 1]
     }
-
-    fn go_up(&mut self) -> bool {
-        if self.import_len > 1 {
-            self.import_len -= 1;
+    fn up(&mut self) -> bool {
+        if self.len > 1 {
+            self.len -= 1;
             true
         } else {
             false
         }
     }
-
-    fn is_same_as_original(&self) -> bool {
-        self.import_len == 1
+    fn same(&self) -> bool {
+        self.len == 1
     }
-
-    fn use_statement(&self) -> Option<String> {
-        (!self.already_imported).then(|| format!("use {};", self.segments[..self.import_len].join("::")))
+    fn use_stmt(&self) -> Option<String> {
+        (!self.exists).then(|| format!("use {};", self.segs[..self.len].join("::")))
     }
-
-    fn replacement(&self) -> String {
-        if self.import_len == self.segments.len() {
-            self.segments.last().unwrap().clone()
+    fn repl(&self) -> String {
+        if self.len == self.segs.len() {
+            self.segs.last().unwrap().clone()
         } else {
-            format!("{}::{}", self.segments[self.import_len - 1], self.segments[self.import_len..].join("::"))
+            format!("{}::{}", self.segs[self.len - 1], self.segs[self.len..].join("::"))
         }
     }
 }
 
-fn resolve_all_imports(
+fn resolve(
     paths: &[String],
-    existing_idents: &BTreeSet<String>,
-    import_mappings: &BTreeMap<String, String>,
-) -> BTreeMap<String, ImportStrategy> {
-    let mut strategies: Vec<ImportStrategy> = paths.iter().map(|p| ImportStrategy::new(p)).collect();
-
-    for strategy in &mut strategies {
-        let short_name = strategy.segments.last().unwrap();
-        if import_mappings.get(short_name).is_some_and(|mapped| mapped == &strategy.full_path) {
-            strategy.already_imported = true;
+    existing: &BTreeSet<String>,
+    mappings: &BTreeMap<String, String>,
+) -> BTreeMap<String, Strategy> {
+    let mut strats: Vec<_> = paths.iter().map(|p| Strategy::new(p)).collect();
+    for s in &mut strats {
+        if mappings.get(s.segs.last().unwrap()).is_some_and(|m| m == &s.full) {
+            s.exists = true;
         }
     }
-
     loop {
         let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (idx, strategy) in strategies.iter().enumerate() {
-            if !strategy.is_same_as_original() && !strategy.already_imported {
-                groups.entry(strategy.import_ident().to_string()).or_default().push(idx);
+        for (i, s) in strats.iter().enumerate() {
+            if !s.same() && !s.exists {
+                groups.entry(s.ident().into()).or_default().push(i);
             }
         }
-
-        let mut has_conflict = false;
-        for indices in groups.values().filter(|v| v.len() > 1) {
-            for &idx in indices {
-                has_conflict |= strategies[idx].go_up();
-            }
-        }
-        if !has_conflict {
-            break;
-        }
-    }
-
-    loop {
-        let mut has_conflict = false;
-        for strategy in &mut strategies {
-            if !strategy.is_same_as_original()
-                && !strategy.already_imported
-                && existing_idents.contains(strategy.import_ident())
-            {
-                has_conflict |= strategy.go_up();
-            }
-        }
-        if !has_conflict {
-            break;
-        }
-    }
-
-    let mut used_idents: BTreeSet<String> = BTreeSet::new();
-    let mut result = BTreeMap::new();
-    for strategy in strategies {
-        if strategy.is_same_as_original() {
-            continue;
-        }
-        let import_ident = strategy.import_ident().to_string();
-        if used_idents.insert(import_ident) {
-            result.insert(strategy.full_path.clone(), strategy);
-        }
-    }
-    result
-}
-
-#[derive(Debug)]
-enum Edit {
-    Insert { pos: usize, text: String },
-    Replace { start: usize, end: usize, text: String },
-}
-
-impl Edit {
-    fn sort_position(&self) -> usize {
-        match self {
-            Edit::Insert { pos, .. } => *pos,
-            Edit::Replace { start, .. } => *start,
-        }
-    }
-}
-
-pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Result<Option<String>> {
-    let src = read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let ast: File = parse_file(&src).with_context(|| format!("failed to parse {}", path.display()))?;
-
-    let line_offsets = LineOffsets::new(&src);
-    let ignore_set: BTreeSet<String> = ignore_roots.iter().cloned().collect();
-    let mut collector = PathCollector::new(&ignore_set, &line_offsets);
-
-    let file_level_imported = collect_imported_idents(&ast);
-    let file_level_insert_pos = find_use_insert_position(&ast, &line_offsets);
-    collector.scope_infos.insert(
-        String::new(),
-        ScopeInfo { insert_pos: file_level_insert_pos, imported_idents: file_level_imported.clone(), indent: String::new() },
-    );
-
-    collector.visit_file(&ast);
-
-    for _ in 0..10 {
-        let snapshot = collector.import_mappings.clone();
         let mut changed = false;
-        for full_path in collector.import_mappings.values_mut() {
-            let normalized = normalize_path(full_path.clone(), &snapshot);
-            if &normalized != full_path {
-                *full_path = normalized;
-                changed = true;
+        for v in groups.values().filter(|v| v.len() > 1) {
+            for &i in v {
+                changed |= strats[i].up();
             }
         }
         if !changed {
             break;
         }
     }
+    loop {
+        let mut changed = false;
+        for s in &mut strats {
+            if !s.same() && !s.exists && existing.contains(s.ident()) {
+                changed |= s.up();
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut used = BTreeSet::new();
+    let mut res = BTreeMap::new();
+    for s in strats {
+        if !s.same() && used.insert(s.ident().to_string()) {
+            res.insert(s.full.clone(), s);
+        }
+    }
+    res
+}
 
-    collector.paths = collector.paths.iter().map(|p| normalize_path(p.clone(), &collector.import_mappings)).collect();
-    for occ in &mut collector.occurrences {
-        occ.full_path_str = normalize_path(occ.full_path_str.clone(), &collector.import_mappings);
+enum Edit {
+    Ins(usize, String),
+    Rep(usize, usize, String),
+}
+impl Edit {
+    fn pos(&self) -> usize {
+        match self {
+            Edit::Ins(p, _) => *p,
+            Edit::Rep(s, _, _) => *s,
+        }
+    }
+}
+
+pub fn process_file(path: &Path, ignore: &[String], dry: bool) -> Result<Option<String>> {
+    let src = read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let ast: File = parse_file(&src).with_context(|| format!("parse {}", path.display()))?;
+    let lines = Lines::new(&src);
+    let ignore: BTreeSet<_> = ignore.iter().cloned().collect();
+    let mut c = Collector::new(&ignore, &lines);
+
+    let file_imports = collect_file_imports(&ast);
+    c.scopes.insert(
+        String::new(),
+        ScopeInfo {
+            pos: find_insert_pos(&ast, &lines),
+            imports: file_imports.clone(),
+            indent: String::new(),
+        },
+    );
+    c.visit_file(&ast);
+
+    for _ in 0..10 {
+        let snap = c.mappings.clone();
+        let mut ch = false;
+        for v in c.mappings.values_mut() {
+            let n = normalize(v.clone(), &snap);
+            if &n != v {
+                *v = n;
+                ch = true;
+            }
+        }
+        if !ch {
+            break;
+        }
+    }
+    c.paths = c.paths.iter().map(|p| normalize(p.clone(), &c.mappings)).collect();
+    for o in &mut c.occs {
+        o.path = normalize(o.path.clone(), &c.mappings);
     }
 
-    if collector.paths.is_empty() {
+    if c.paths.is_empty() {
         return Ok(None);
     }
 
-    let used_prelude_types = collect_unqualified_prelude_usages(&ast);
-    let file_level_defs = collect_file_level_definitions(&ast);
-
-    let mut occ_by_scope: BTreeMap<&str, Vec<&PathOccurrence>> = BTreeMap::new();
-    for occ in &collector.occurrences {
-        occ_by_scope.entry(&occ.scope).or_default().push(occ);
+    let prelude = collect_prelude(&ast);
+    let defs = collect_defs(&ast);
+    let mut by_scope: BTreeMap<&str, Vec<&Occurrence>> = BTreeMap::new();
+    for o in &c.occs {
+        by_scope.entry(&o.scope).or_default().push(o);
     }
 
     let mut edits: Vec<Edit> = Vec::new();
-
-    for (scope, occurrences) in &occ_by_scope {
-        let scope_info = collector.scope_infos.get(*scope).unwrap_or_else(|| collector.scope_infos.get("").unwrap());
-
-        let mut existing_idents: BTreeSet<String> = file_level_imported.clone();
-        existing_idents.extend(scope_info.imported_idents.clone());
-        existing_idents.extend(used_prelude_types.clone());
-        existing_idents.extend(file_level_defs.clone());
-        for occ in occurrences {
-            existing_idents.extend(occ.local_bindings.clone());
+    for (scope, occs) in &by_scope {
+        let info = c.scopes.get(*scope).unwrap_or_else(|| c.scopes.get("").unwrap());
+        let mut existing = file_imports.clone();
+        existing.extend(info.imports.clone());
+        existing.extend(prelude.clone());
+        existing.extend(defs.clone());
+        for o in occs {
+            existing.extend(o.locals.clone());
         }
 
-        let scope_paths: Vec<String> = occurrences.iter().map(|o| o.full_path_str.clone()).collect::<BTreeSet<_>>().into_iter().collect();
-        let strategies = resolve_all_imports(&scope_paths, &existing_idents, &collector.import_mappings);
+        let scope_paths: Vec<_> = occs
+            .iter()
+            .map(|o| o.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let strats = resolve(&scope_paths, &existing, &c.mappings);
 
-        let mut use_by_cfg: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
-
-        for occ in occurrences {
-            if let Some(strategy) = strategies.get(&occ.full_path_str) {
-                if let Some(use_stmt) = strategy.use_statement() {
-                    use_by_cfg.entry(occ.cfg_attrs.clone()).or_default().insert(use_stmt);
+        let mut by_cfg: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
+        for o in occs {
+            if let Some(s) = strats.get(&o.path) {
+                if let Some(u) = s.use_stmt() {
+                    by_cfg.entry(o.cfg.clone()).or_default().insert(u);
                 }
-
-                if let (Some(start), Some(end)) = (
-                    line_offsets.line_col_to_byte(occ.start_line, occ.start_col),
-                    line_offsets.line_col_to_byte(occ.end_line, occ.end_col),
-                ) {
-                    edits.push(Edit::Replace { start, end, text: strategy.replacement() });
+                if let (Some(st), Some(en)) =
+                    (lines.to_byte(o.start.0, o.start.1), lines.to_byte(o.end.0, o.end.1))
+                {
+                    edits.push(Edit::Rep(st, en, s.repl()));
                 }
             }
         }
 
-        if !use_by_cfg.is_empty() {
-            let indent = &scope_info.indent;
-            let mut use_blocks: Vec<String> = Vec::new();
-
-            for (cfg_attrs, use_stmts) in &use_by_cfg {
-                if cfg_attrs.is_empty() {
-                    use_blocks.extend(use_stmts.iter().map(|s| format!("{indent}{s}")));
+        if !by_cfg.is_empty() {
+            let ind = &info.indent;
+            let mut blocks = Vec::new();
+            for (cfg, stmts) in &by_cfg {
+                if cfg.is_empty() {
+                    blocks.extend(stmts.iter().map(|s| format!("{ind}{s}")));
                 } else {
-                    let cfg_prefix: String = cfg_attrs.iter().map(|cfg| format!("{indent}#[{cfg}]\n")).collect();
-                    use_blocks.extend(use_stmts.iter().map(|s| format!("{cfg_prefix}{indent}{s}")));
+                    let pre: String = cfg.iter().map(|c| format!("{ind}#[{c}]\n")).collect();
+                    blocks.extend(stmts.iter().map(|s| format!("{pre}{ind}{s}")));
                 }
             }
-
-            if !use_blocks.is_empty() {
-                edits.push(Edit::Insert { pos: scope_info.insert_pos, text: format!("\n{}\n", use_blocks.join("\n")) });
+            if !blocks.is_empty() {
+                edits.push(Edit::Ins(info.pos, format!("\n{}\n", blocks.join("\n"))));
             }
         }
     }
@@ -590,112 +522,100 @@ pub fn process_file(path: &Path, ignore_roots: &[String], dry_run: bool) -> Resu
     if edits.is_empty() {
         return Ok(None);
     }
-
-    edits.sort_by_key(|e| Reverse(e.sort_position()));
-
-    let mut new_src = src.clone();
-    for edit in edits {
-        match edit {
-            Edit::Insert { pos, text } => new_src.insert_str(pos, &text),
-            Edit::Replace { start, end, text } => new_src.replace_range(start..end, &text),
+    edits.sort_by_key(|e| Reverse(e.pos()));
+    let mut out = src.clone();
+    for e in edits {
+        match e {
+            Edit::Ins(p, t) => out.insert_str(p, &t),
+            Edit::Rep(s, e, t) => out.replace_range(s..e, &t),
         }
     }
-
-    if new_src == src {
+    if out == src {
         return Ok(None);
     }
-
-    if dry_run {
-        return Ok(Some(format_diff(path, &src, &new_src)));
+    if dry {
+        return Ok(Some(diff(path, &src, &out)));
     }
-
-    write(path, &new_src).with_context(|| format!("failed to write {}", path.display()))?;
+    write(path, &out).with_context(|| format!("write {}", path.display()))?;
     Ok(Some(String::new()))
 }
 
-fn path_to_string(path: &SynPath) -> String {
-    path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::")
+fn path_str(p: &SynPath) -> String {
+    p.segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
-struct LineOffsets {
-    lines: Vec<(usize, Vec<usize>)>,
-}
-
-impl LineOffsets {
+struct Lines(Vec<(usize, Vec<usize>)>);
+impl Lines {
     fn new(src: &str) -> Self {
         let mut lines = Vec::new();
-        let mut current_char_offsets = Vec::new();
-        let mut line_start_byte = 0;
-
-        for (byte_idx, ch) in src.char_indices() {
-            if ch == '\n' {
-                lines.push((line_start_byte, current_char_offsets));
-                current_char_offsets = Vec::new();
-                line_start_byte = byte_idx + 1;
+        let mut cur = Vec::new();
+        let mut start = 0;
+        for (i, c) in src.char_indices() {
+            if c == '\n' {
+                lines.push((start, cur));
+                cur = Vec::new();
+                start = i + 1;
             } else {
-                current_char_offsets.push(byte_idx - line_start_byte);
+                cur.push(i - start);
             }
         }
-        lines.push((line_start_byte, current_char_offsets));
-        Self { lines }
+        lines.push((start, cur));
+        Self(lines)
     }
-
-    fn line_col_to_byte(&self, line: usize, col: usize) -> Option<usize> {
-        if line == 0 || line > self.lines.len() {
+    fn to_byte(&self, line: usize, col: usize) -> Option<usize> {
+        if line == 0 || line > self.0.len() {
             return None;
         }
-        let (line_start, char_offsets) = &self.lines[line - 1];
-        if col >= char_offsets.len() {
-            return Some(line_start + char_offsets.last().map_or(0, |&o| o + 1));
-        }
-        Some(line_start + char_offsets[col])
+        let (s, o) = &self.0[line - 1];
+        Some(if col >= o.len() { s + o.last().map_or(0, |&x| x + 1) } else { s + o[col] })
     }
-
-    fn line_end_byte(&self, line: usize) -> usize {
-        if line == 0 || line > self.lines.len() {
+    fn end(&self, line: usize) -> usize {
+        if line == 0 || line > self.0.len() {
             return 0;
         }
-        if line < self.lines.len() {
-            self.lines[line].0 - 1
+        if line < self.0.len() {
+            self.0[line].0 - 1
         } else {
-            let (line_start, char_offsets) = &self.lines[line - 1];
-            line_start + char_offsets.last().map_or(0, |&o| o + 1)
+            let (s, o) = &self.0[line - 1];
+            s + o.last().map_or(0, |&x| x + 1)
         }
     }
 }
 
-fn find_use_insert_position(ast: &File, line_offsets: &LineOffsets) -> usize {
+fn find_insert_pos(ast: &File, lines: &Lines) -> usize {
     ast.items
         .iter()
-        .filter_map(|item| match item {
-            Item::Use(item_use) => Some(line_offsets.line_end_byte(item_use.span().end().line)),
-            _ => None,
-        })
-        .last()
+        .filter_map(
+            |i| if let Item::Use(u) = i { Some(lines.end(u.span().end().line)) } else { None },
+        )
+        .next_back()
         .unwrap_or(0)
 }
 
-fn collect_imported_idents(ast: &File) -> BTreeSet<String> {
-    let mut idents = BTreeSet::new();
-    for item in &ast.items {
-        if let Item::Use(item_use) = item {
-            collect_use_idents(&item_use.tree, &mut idents);
+fn collect_file_imports(ast: &File) -> BTreeSet<String> {
+    let mut s = BTreeSet::new();
+    for i in &ast.items {
+        if let Item::Use(u) = i {
+            collect_idents(&u.tree, &mut s);
         }
     }
-    idents
+    s
 }
 
-fn collect_use_idents(tree: &UseTree, out: &mut BTreeSet<String>) {
-    collect_use_idents_impl(tree, None, out);
+fn collect_idents(tree: &UseTree, out: &mut BTreeSet<String>) {
+    collect_idents_impl(tree, None, out);
 }
-
-fn collect_use_idents_impl(tree: &UseTree, parent: Option<&str>, out: &mut BTreeSet<String>) {
+fn collect_idents_impl(tree: &UseTree, parent: Option<&str>, out: &mut BTreeSet<String>) {
     match tree {
         UseTree::Name(n) => {
             let name = n.ident.to_string();
             if name == "self" {
                 if let Some(p) = parent {
-                    out.insert(p.to_string());
+                    out.insert(p.into());
                 }
             } else {
                 out.insert(name);
@@ -705,93 +625,81 @@ fn collect_use_idents_impl(tree: &UseTree, parent: Option<&str>, out: &mut BTree
             out.insert(r.rename.to_string());
         }
         UseTree::Path(p) => {
-            let ident = p.ident.to_string();
-            collect_use_idents_impl(&p.tree, Some(&ident), out);
+            collect_idents_impl(&p.tree, Some(&p.ident.to_string()), out);
         }
         UseTree::Group(g) => {
             for t in &g.items {
-                collect_use_idents_impl(t, parent, out);
+                collect_idents_impl(t, parent, out);
             }
         }
         UseTree::Glob(_) => {}
     }
 }
 
-fn is_internal_use_tree(tree: &UseTree) -> bool {
+fn is_internal(tree: &UseTree) -> bool {
     match tree {
-        UseTree::Path(p) => {
-            let first = p.ident.to_string();
-            first == "crate" || first == "self" || first == "super"
-        }
-        UseTree::Group(g) => g.items.iter().all(is_internal_use_tree),
+        UseTree::Path(p) => matches!(p.ident.to_string().as_str(), "crate" | "self" | "super"),
+        UseTree::Group(g) => g.items.iter().all(is_internal),
         _ => false,
     }
 }
 
-fn normalize_path(full: String, mappings: &BTreeMap<String, String>) -> String {
-    let segments: Vec<&str> = full.split("::").collect();
-    if let Some(&first) = segments.first() {
-        if let Some(base) = mappings.get(first) {
-            let base_first = base.split("::").next().unwrap_or("");
-            if base_first != first {
-                let mut new_segments: Vec<&str> = base.split("::").collect();
-                new_segments.extend(segments.iter().skip(1));
-                return new_segments.join("::");
-            }
-        }
+fn normalize(full: String, m: &BTreeMap<String, String>) -> String {
+    let segs: Vec<&str> = full.split("::").collect();
+    if let Some(base) = segs.first().and_then(|f| m.get(*f))
+        && base.split("::").next().unwrap_or("") != *segs.first().unwrap()
+    {
+        let mut n: Vec<&str> = base.split("::").collect();
+        n.extend(segs.iter().skip(1));
+        return n.join("::");
     }
     full
 }
 
-fn collect_use_mappings(tree: &UseTree, prefix: &[String], out: &mut BTreeMap<String, String>) {
+fn collect_mappings(tree: &UseTree, prefix: &[String], out: &mut BTreeMap<String, String>) {
     match tree {
         UseTree::Name(n) => {
             let name = n.ident.to_string();
             if name == "self" {
-                if let Some(local_name) = prefix.last() {
-                    let full = normalize_path(prefix.join("::"), out);
-                    out.insert(local_name.clone(), full);
+                if let Some(l) = prefix.last() {
+                    out.insert(l.clone(), normalize(prefix.join("::"), out));
                 }
             } else {
-                let mut parts = prefix.to_vec();
-                parts.push(name.clone());
-                let full = normalize_path(parts.join("::"), out);
-                out.insert(name, full);
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                out.insert(name, normalize(p.join("::"), out));
             }
         }
         UseTree::Rename(r) => {
-            let alias = r.rename.to_string();
-            let original = r.ident.to_string();
-            if original == "self" {
-                let full = normalize_path(prefix.join("::"), out);
-                out.insert(alias, full);
+            let (alias, orig) = (r.rename.to_string(), r.ident.to_string());
+            if orig == "self" {
+                out.insert(alias, normalize(prefix.join("::"), out));
             } else {
-                let mut parts = prefix.to_vec();
-                parts.push(original);
-                let full = normalize_path(parts.join("::"), out);
-                out.insert(alias, full);
+                let mut p = prefix.to_vec();
+                p.push(orig);
+                out.insert(alias, normalize(p.join("::"), out));
             }
         }
         UseTree::Path(p) => {
-            let mut new_prefix = prefix.to_vec();
-            new_prefix.push(p.ident.to_string());
-            collect_use_mappings(&p.tree, &new_prefix, out);
+            let mut np = prefix.to_vec();
+            np.push(p.ident.to_string());
+            collect_mappings(&p.tree, &np, out);
         }
         UseTree::Group(g) => {
             for t in &g.items {
-                collect_use_mappings(t, prefix, out);
+                collect_mappings(t, prefix, out);
             }
         }
         UseTree::Glob(_) => {}
     }
 }
 
-fn collect_file_level_definitions(ast: &File) -> BTreeSet<String> {
-    let mut set = BTreeSet::new();
-    for item in &ast.items {
-        match item {
-            Item::Fn(ItemFn { sig, .. }) => {
-                set.insert(sig.ident.to_string());
+fn collect_defs(ast: &File) -> BTreeSet<String> {
+    let mut s = BTreeSet::new();
+    for i in &ast.items {
+        match i {
+            Item::Fn(f) => {
+                s.insert(f.sig.ident.to_string());
             }
             Item::Struct(ItemStruct { ident, .. })
             | Item::Enum(ItemEnum { ident, .. })
@@ -799,100 +707,80 @@ fn collect_file_level_definitions(ast: &File) -> BTreeSet<String> {
             | Item::Trait(ItemTrait { ident, .. })
             | Item::Type(ItemType { ident, .. })
             | Item::Mod(ItemMod { ident, .. }) => {
-                set.insert(ident.to_string());
+                s.insert(ident.to_string());
             }
             Item::Static(ItemStatic { ident, .. }) | Item::Const(ItemConst { ident, .. }) => {
-                set.insert(ident.to_string());
+                s.insert(ident.to_string());
             }
             Item::Impl(ItemImpl { items, .. }) => {
-                for impl_item in items {
-                    if let syn::ImplItem::Fn(f) = impl_item {
-                        set.insert(f.sig.ident.to_string());
+                for ii in items {
+                    if let syn::ImplItem::Fn(f) = ii {
+                        s.insert(f.sig.ident.to_string());
                     }
                 }
             }
             _ => {}
         }
     }
-    set
+    s
 }
 
-fn collect_pattern_idents(pat: &Pat, out: &mut BTreeSet<String>) {
+fn collect_pat(pat: &Pat, out: &mut BTreeSet<String>) {
     match pat {
         Pat::Ident(p) => {
             out.insert(p.ident.to_string());
         }
-        Pat::Tuple(tuple) => {
-            for p in &tuple.elems {
-                collect_pattern_idents(p, out);
-            }
-        }
-        Pat::Struct(s) => {
-            for field in &s.fields {
-                collect_pattern_idents(&field.pat, out);
-            }
-        }
-        Pat::TupleStruct(ts) => {
-            for p in &ts.elems {
-                collect_pattern_idents(p, out);
-            }
-        }
-        Pat::Slice(slice) => {
-            for p in &slice.elems {
-                collect_pattern_idents(p, out);
-            }
-        }
-        Pat::Reference(r) => {
-            collect_pattern_idents(&r.pat, out);
-        }
-        Pat::Or(or) => {
-            for p in &or.cases {
-                collect_pattern_idents(p, out);
-            }
-        }
+        Pat::Tuple(t) => t.elems.iter().for_each(|p| collect_pat(p, out)),
+        Pat::Struct(s) => s.fields.iter().for_each(|f| collect_pat(&f.pat, out)),
+        Pat::TupleStruct(t) => t.elems.iter().for_each(|p| collect_pat(p, out)),
+        Pat::Slice(s) => s.elems.iter().for_each(|p| collect_pat(p, out)),
+        Pat::Reference(r) => collect_pat(&r.pat, out),
+        Pat::Or(o) => o.cases.iter().for_each(|p| collect_pat(p, out)),
         _ => {}
     }
 }
 
-fn collect_unqualified_prelude_usages(ast: &File) -> BTreeSet<String> {
-    struct PreludeCollector(BTreeSet<String>);
-
-    impl<'ast> Visit<'ast> for PreludeCollector {
-        fn visit_type_path(&mut self, node: &'ast TypePath) {
-            if node.qself.is_none() && node.path.segments.len() == 1 {
-                let ident = node.path.segments[0].ident.to_string();
-                if PRELUDE_TYPES.contains(&ident.as_str()) {
-                    self.0.insert(ident);
+fn collect_prelude(ast: &File) -> BTreeSet<String> {
+    struct V(BTreeSet<String>);
+    impl<'a> Visit<'a> for V {
+        fn visit_type_path(&mut self, n: &'a TypePath) {
+            if n.qself.is_none() && n.path.segments.len() == 1 {
+                let id = n.path.segments[0].ident.to_string();
+                if PRELUDE.contains(&id.as_str()) {
+                    self.0.insert(id);
                 }
             }
-            visit::visit_type_path(self, node);
+            visit::visit_type_path(self, n);
         }
     }
-
-    let mut collector = PreludeCollector(BTreeSet::new());
-    collector.visit_file(ast);
-    collector.0
+    let mut v = V(BTreeSet::new());
+    v.visit_file(ast);
+    v.0
 }
 
-fn format_diff(path: &Path, old: &str, new: &str) -> String {
+fn diff(path: &Path, old: &str, new: &str) -> String {
     use std::fmt::Write;
-    let diff = TextDiff::from_lines(old, new);
-    let mut output = String::new();
-    writeln!(output, "--- {}", path.display()).unwrap();
-    writeln!(output, "+++ {}", path.display()).unwrap();
-    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        writeln!(output, "{}", hunk.header()).unwrap();
-        for change in hunk.iter_changes() {
-            let sign = match change.tag() {
-                ChangeTag::Delete => "-",
-                ChangeTag::Insert => "+",
-                ChangeTag::Equal => " ",
-            };
-            write!(output, "{sign}{change}").unwrap();
-            if change.missing_newline() {
-                writeln!(output).unwrap();
+    let d = TextDiff::from_lines(old, new);
+    let mut out = String::new();
+    writeln!(out, "--- {}", path.display()).unwrap();
+    writeln!(out, "+++ {}", path.display()).unwrap();
+    for h in d.unified_diff().context_radius(3).iter_hunks() {
+        writeln!(out, "{}", h.header()).unwrap();
+        for c in h.iter_changes() {
+            write!(
+                out,
+                "{}{c}",
+                match c.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                }
+            )
+            .unwrap();
+            if c.missing_newline() {
+                writeln!(out).unwrap();
             }
         }
     }
-    output
+    out
 }

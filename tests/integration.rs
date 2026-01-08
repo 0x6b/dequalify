@@ -1047,7 +1047,8 @@ impl FromStr for Config {
 }
 "#;
     let output = process_source(input, &[]);
-    // Should dequalify Formatter but NOT Result (since Result<Self, Self::Err> uses prelude's Result)
+    // Should dequalify Formatter but NOT Result (since Result<Self, Self::Err> uses prelude's
+    // Result)
     assert!(
         output.contains("use std::fmt::Formatter;"),
         "Should have `use std::fmt::Formatter;`, got:\n{output}"
@@ -1151,7 +1152,8 @@ mod platform {
     // Both cfg attributes should be stacked on the same use statement
     // The order is sorted alphabetically: cfg(feature = "async") before cfg(unix)
     assert!(
-        output.contains("#[cfg(feature = \"async\")]\n    #[cfg(unix)]\n    use tokio::task::spawn;"),
+        output
+            .contains("#[cfg(feature = \"async\")]\n    #[cfg(unix)]\n    use tokio::task::spawn;"),
         "Should have both cfg attributes stacked on use statement, got:\n{output}"
     );
 }
@@ -1264,10 +1266,7 @@ fn main() {
         "Should dequalify io::stdin() to stdin(), got:\n{output}"
     );
     // stdout() should remain (already imported via chained import)
-    assert!(
-        output.contains("stdout()"),
-        "Should keep stdout(), got:\n{output}"
-    );
+    assert!(output.contains("stdout()"), "Should keep stdout(), got:\n{output}");
 }
 
 #[test]
@@ -1294,12 +1293,9 @@ fn main() {
     // io::stdout() should be rewritten to just stdout() since it's already imported
     // OR it could be kept as io::stdout() if there's a conflict resolution issue
     // The key is we shouldn't add a duplicate import for stdout
-    let stdout_import_count = output.matches("use std::io::stdout;").count()
-        + output.matches("use io::stdout;").count();
-    assert!(
-        stdout_import_count <= 1,
-        "Should not have duplicate stdout imports, got:\n{output}"
-    );
+    let stdout_import_count =
+        output.matches("use std::io::stdout;").count() + output.matches("use io::stdout;").count();
+    assert!(stdout_import_count <= 1, "Should not have duplicate stdout imports, got:\n{output}");
 }
 
 #[test]
@@ -1410,10 +1406,7 @@ fn main() {
         "Should rewrite io::stdout() to stdout() inside println!, got:\n{output}"
     );
     // std::env::var should be rewritten
-    assert!(
-        output.contains("use std::env::var;"),
-        "Should add use std::env::var, got:\n{output}"
-    );
+    assert!(output.contains("use std::env::var;"), "Should add use std::env::var, got:\n{output}");
     assert!(
         output.contains("var(\"HOME\")"),
         "Should rewrite std::env::var to var, got:\n{output}"
